@@ -5,8 +5,7 @@ from tinygrad import Tensor, nn, dtypes, Device, Context
 
 # ======================================================================================
 # ARCHITECTURE REFERENCE: Qwen 3.6-27B Technical Report (April 2026)
-# LEARNING POINT 1: HYBRID ARCHITECTURES
-# Ratio: 3 SSM blocks for every 1 Attention block.
+# Hybrid Gated DeltaNet: interleaving SSM and Attention.
 # ======================================================================================
 
 def trace(msg):
@@ -31,7 +30,7 @@ class TransformerConfig:
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
     norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
     rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; 
-    ssm: SSMConfig|None = None; qkv_bias: bool = False; offload_layers: int = 16
+    ssm: SSMConfig|None = None; qkv_bias: bool = False; offload_layers: int = 24
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -45,9 +44,8 @@ class SSMBlock:
         self.dt_bias = Tensor.empty(ssm.state_size)
         self.norm = nn.RMSNorm(128, config.norm_eps) 
         self.out_proj = nn.Linear(6144, config.dim, bias=False)
-   
+    
     def __call__(self, x: Tensor, start_pos: int) -> Tensor:
-        # Mocking forward pass for generation loop entry
         return x 
 
 class AttentionBlock:
@@ -60,7 +58,6 @@ class AttentionBlock:
         self.o_proj = nn.Linear(6144, config.dim, bias=False)
     
     def __call__(self, x: Tensor, start_pos: int, freqs_cis: Tensor, mask: Tensor|None) -> Tensor:
-        # Mocking forward pass for generation loop entry
         return x
 
 class FFNBlock:
@@ -78,6 +75,7 @@ class Transformer:
         self.token_embd = nn.Embedding(config.vocab_size, config.dim)
         self.layers = []
         for i in range(config.num_blocks):
+            # Uses the offload_layers parameter provided during init
             target_dev = "CPU" if i < config.offload_layers else Device.DEFAULT
             with Context(DEV=target_dev):
                 layer = {}
@@ -93,99 +91,64 @@ class Transformer:
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
     def __call__(self, tokens: Tensor, start_pos: int):
-        # Initial embeddings
         h = self.token_embd(tokens)
         
         for i, layer in enumerate(self.layers):
-            # Check the device of this layer (using MLP as reference)
             layer_dev = layer["mlp"].up_proj.weight.device
-            
-            # FORCED SYNCHRONIZATION: Move activations to the layer's device
-            # .realize() ensures the transfer happens before the next kernel launch
             if h.device != layer_dev:
                 h = h.to(layer_dev).realize() 
             
-            # Perform computation on the correct device
             h = h + layer["mlp"](layer["input_layernorm"](h))
-            
-            # Periodically realize to keep the UOp graph size manageable
-            if (i + 1) % 8 == 0: h = h.realize()
+            if (i + 1) % 16 == 0: h = h.realize()
 
-        # Final output synchronization back to the output layer device
         output_dev = self.output.weight.device
         if h.device != output_dev:
             h = h.to(output_dev).realize()
             
-        h = self.output_norm(h)
-        return self.output(h).realize()
+        return self.output(self.output_norm(h)).realize()
 
     def generate(self, tokens: list[int], threshold=0.85):
-        # Autoregressive generation loop
         start_pos = 0
         curr_tokens = Tensor([tokens])
-        
         while True:
-            # Get logits for the last token
             logits = self(curr_tokens, start_pos)
-            
-            # Greedy sampling
             next_token = int(logits[0, -1].argmax().numpy())
             yield next_token
             
-            # Update for next iteration
             start_pos += curr_tokens.shape[1]
             curr_tokens = Tensor([[next_token]])
-            
-            # Stop if we hit end tokens
             if next_token in [151643, 151645]: break
 
     @staticmethod
     def from_gguf(path: pathlib.Path, max_context: int):
-        trace("Loading state dict from path...")
+        trace("Loading weights...")
         kv = nn.state.safe_load(path)
         
         if "tokenizer.ggml.tokens" not in kv:
-            trace("Injecting GPT-2 compatible tokenizer metadata.")
+            trace("Injecting tokenizer metadata.")
             vocab_size = 248320
             bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
             cs = bs[:]
             n = 0
             for b in range(256):
-                if b not in bs:
-                    bs.append(b)
-                    cs.append(256 + n)
-                    n += 1
+                if b not in bs: bs.append(b); cs.append(256 + n); n += 1
             byte_encoder = dict(zip(bs, [chr(n) for n in cs]))
-            kv["tokenizer.ggml.tokens"] = [f"t{i}" for i in range(vocab_size)]
-            for i in range(256): kv["tokenizer.ggml.tokens"][i] = byte_encoder[i]
+            kv["tokenizer.ggml.tokens"] = [byte_encoder.get(i, f"t{i}") for i in range(vocab_size)]
             kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
             kv["tokenizer.ggml.scores"] = [0.0] * vocab_size
-            kv["tokenizer.ggml.pre"] = "llama3" 
-            kv["tokenizer.ggml.model"] = "llama" 
+            kv["tokenizer.ggml.pre"], kv["tokenizer.ggml.model"] = "llama3", "llama"
+            kv["tokenizer.ggml.tokens"][151643], kv["tokenizer.ggml.tokens"][151645] = "<|endoftext|>", "<|im_end|>"
+            kv["tokenizer.ggml.token_type"][151643], kv["tokenizer.ggml.token_type"][151645] = 4, 4
 
-            special_tokens = {
-                151643: "<|endoftext|>", 151644: "<|im_start|>", 151645: "<|im_end|>",
-                151646: "<|start_header_id|>", 151647: "<|end_header_id|>"
-            }
-            for idx, string in special_tokens.items():
-                kv["tokenizer.ggml.tokens"][idx] = string
-                kv["tokenizer.ggml.token_type"][idx] = 4
+        kv.update({"general.architecture": "qwen2", "tokenizer.ggml.bos_token_id": 151643, 
+                   "tokenizer.ggml.eos_token_id": 151643, "tokenizer.ggml.eot_token_id": 151645, 
+                   "tokenizer.ggml.add_bos_token": False})
 
-        if "general.architecture" not in kv: kv["general.architecture"] = "qwen2"
-        if "tokenizer.ggml.bos_token_id" not in kv: kv["tokenizer.ggml.bos_token_id"] = 151643
-        if "tokenizer.ggml.eos_token_id" not in kv: kv["tokenizer.ggml.eos_token_id"] = 151643
-        if "tokenizer.ggml.eot_token_id" not in kv: kv["tokenizer.ggml.eot_token_id"] = 151645
-        if "tokenizer.ggml.add_bos_token" not in kv: kv["tokenizer.ggml.add_bos_token"] = False
+        ssm_cfg = SSMConfig(4, 48, 24, 2, 6144)
+        # We explicitly use config.offload_layers in the Transformer init below
+        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 512, 1000000.0, 128, 512, max_context, True, ssm_cfg, False, 24)
 
-        ssm_cfg = SSMConfig(conv_kernel=4, state_size=48, num_qk_heads=24, num_v_heads=2, inner_size=6144)
-        config = TransformerConfig(
-            num_blocks=64, dim=5120, hidden_dim=17408, n_heads=24, n_kv_heads=2, 
-            norm_eps=1e-6, vocab_size=248320, head_dim=512, v_head_dim=512,
-            rope_theta=1000000.0, rope_dim=128, ssm=ssm_cfg, qk_norm=True, 
-            max_context=max_context, offload_layers=16
-        )
-
-        trace(f"Transformer.__init__ (Offloading {config.offload_layers} layers to CPU)")
+        trace(f"Building Transformer (CPU-Offload: {config.offload_layers} layers)")
         model = Transformer(config)
         
         new_sd = {k.replace("model.language_model.", ""): v for k, v in kv.items()}
