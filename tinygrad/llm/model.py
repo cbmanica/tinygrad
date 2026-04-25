@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, sys, pathlib, re
+import functools, sys, pathlib, re, typing
 from dataclasses import dataclass
 from tinygrad import Tensor, nn, dtypes, Device, Context
 
@@ -30,7 +30,7 @@ class TransformerConfig:
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
     norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
     rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; 
-    ssm: SSMConfig|None = None; qkv_bias: bool = False; offload_layers: int = 24
+    ssm: SSMConfig|None = None; qkv_bias: bool = False; offload_layers: int = 32
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -56,6 +56,15 @@ class AttentionBlock:
         self.q_norm = nn.RMSNorm(256, config.norm_eps) 
         self.k_norm = nn.RMSNorm(256, config.norm_eps)
         self.o_proj = nn.Linear(6144, config.dim, bias=False)
+        
+        # Initialize as None so they are ignored by load_state_dict
+        self.k_cache: typing.Optional[Tensor] = None
+        self.v_cache: typing.Optional[Tensor] = None
+
+    def reset_cache(self, config: TransformerConfig):
+        # Explicitly force KV cache to CPU to save VRAM on the AMD card
+        self.k_cache = Tensor.zeros(config.max_context, config.n_kv_heads, config.head_dim, device="CPU")
+        self.v_cache = Tensor.zeros(config.max_context, config.n_kv_heads, config.head_dim, device="CPU")
     
     def __call__(self, x: Tensor, start_pos: int, freqs_cis: Tensor, mask: Tensor|None) -> Tensor:
         return x
@@ -75,8 +84,7 @@ class Transformer:
         self.token_embd = nn.Embedding(config.vocab_size, config.dim)
         self.layers = []
         for i in range(config.num_blocks):
-            # Uses the offload_layers parameter provided during init
-            target_dev = "CPU" if i < config.offload_layers else Device.DEFAULT
+            target_dev = "CPU" if i < config.offload_layers else "METAL"
             with Context(DEV=target_dev):
                 layer = {}
                 layer["input_layernorm"] = nn.RMSNorm(config.dim, config.norm_eps)
@@ -96,10 +104,11 @@ class Transformer:
         for i, layer in enumerate(self.layers):
             layer_dev = layer["mlp"].up_proj.weight.device
             if h.device != layer_dev:
-                h = h.to(layer_dev).realize() 
+                # Realize CPU tensors before moving to METAL to prevent hardware bus errors
+                h = h.realize().to(layer_dev).realize() 
             
             h = h + layer["mlp"](layer["input_layernorm"](h))
-            if (i + 1) % 16 == 0: h = h.realize()
+            if (i + 1) % 8 == 0: h = h.realize()
 
         output_dev = self.output.weight.device
         if h.device != output_dev:
@@ -145,8 +154,7 @@ class Transformer:
                    "tokenizer.ggml.add_bos_token": False})
 
         ssm_cfg = SSMConfig(4, 48, 24, 2, 6144)
-        # We explicitly use config.offload_layers in the Transformer init below
-        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 512, 1000000.0, 128, 512, max_context, True, ssm_cfg, False, 24)
+        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 512, 1000000.0, 128, 512, max_context, True, ssm_cfg, False, 32)
 
         trace(f"Building Transformer (CPU-Offload: {config.offload_layers} layers)")
         model = Transformer(config)
@@ -156,5 +164,12 @@ class Transformer:
         for old, new in mapping.items():
             if old in new_sd: new_sd[new] = new_sd.pop(old)
 
+        # 1. Load weights (ignores the None cache attributes)
         nn.state.load_state_dict(model, new_sd, consume=True)
+
+        # 2. Manually initialize the CPU-bound KV cache after weights are placed
+        for layer in model.layers:
+            if "self_attn" in layer:
+                layer["self_attn"].reset_cache(config)
+        
         return model, kv
