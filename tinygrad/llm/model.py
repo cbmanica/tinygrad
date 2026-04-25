@@ -5,9 +5,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, Context, Device
 from tinygrad.uop.ops import resolve
 
 # ARCHITECTURE REFERENCE: Qwen 3.6-27B Technical Report (April 2026)
-# https://qwen.ai/blog?id=qwen3.6-27b
 # RESEARCH REFERENCE: "Gated Delta Networks: Improving Mamba2 with Delta Rule" (2025/2026)
-# https://arxiv.org/abs/2604.15804 (Qwen 3.5-Omni/3.6 Series Architecture)
 
 def trace(msg):
     print(f"--- [TRACE] {msg} ---")
@@ -24,10 +22,6 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 @dataclass(frozen=True)
 class SSMConfig:
-    # Gated DeltaNet specific parameters:
-    # conv_kernel: 4 (Local context window)
-    # state_size: 16 (d_k - Key dimension for recurrent associative memory)
-    # inner_size: 6144 (Gating and expansion dimension)
     conv_kernel: int; state_size: int; num_qk_heads: int; num_v_heads: int; inner_size: int
 
 @dataclass(frozen=True)
@@ -35,7 +29,6 @@ class TransformerConfig:
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; ssm: SSMConfig|None = None; qkv_bias: bool = False
 
 class FFNBlock:
-    """Standard Qwen 3.6 SwiGLU Feed-Forward Network."""
     def __init__(self, config:TransformerConfig):
         self.config = config
         self.attn_norm = nn.RMSNorm(config.dim, config.norm_eps)
@@ -56,11 +49,6 @@ class FFNBlock:
         return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
-    """
-    Standard Softmax Attention Block.
-    Ref: Qwen 3.6 uses 'Full Attention' every 4th layer.
-    Head Dimension is 256 for standard attention to maintain high-rank modeling.
-    """
     def __init__(self, config:TransformerConfig):
         super().__init__(config)
         self.head_dim = 256 
@@ -77,7 +65,6 @@ class TransformerBlock(FFNBlock):
         q, k, v = q.reshape(B, T, self.config.n_heads, self.head_dim), k.reshape(B, T, self.config.n_kv_heads, self.head_dim), v.reshape(B, T, self.config.n_kv_heads, self.head_dim)
         if self.attn_q_norm: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        # Apply Partial RoPE: rope_dim=64 as specified in GGUF/Safetensor headers
         q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
         k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
         assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
@@ -89,14 +76,6 @@ class TransformerBlock(FFNBlock):
             self.cache_kv, self.freqs_cis = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.head_dim, device=x.device), precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
 
 class GatedDeltaNetBlock(FFNBlock):
-    """
-    Linear Attention (Gated DeltaNet) Block.
-    Ref: Gated Delta Networks (2025) - Combines Mamba2 gating with Delta Rule updates.
-    Key implementation details:
-    - Delta Rule Update: S_t = S_{t-1} + k_t @ (beta_t * (v_t - S_{t-1} @ k_t))^T
-    - L2 Normalization on Q/K heads.
-    - Local context via Causal Conv1D (kernel=4).
-    """
     def __init__(self, config:TransformerConfig, ssm:SSMConfig):
         super().__init__(config)
         self.ssm = ssm
@@ -106,8 +85,9 @@ class GatedDeltaNetBlock(FFNBlock):
         self.attn_gate = nn.Linear(config.dim, ssm.inner_size, bias=False)
         self.ssm_alpha = nn.Linear(config.dim, ssm.num_v_heads, bias=False)
         self.ssm_beta = nn.Linear(config.dim, ssm.num_v_heads, bias=False)
-        self.ssm_conv1d = nn.Linear(ssm.conv_kernel, self.qkv_dim, bias=False)
-        self.ssm_dt = nn.Linear(config.dim, ssm.num_v_heads, bias=True)
+        self.ssm_conv1d_weight = Tensor.empty(self.qkv_dim, 1, ssm.conv_kernel)
+        # Fix: ssm_dt is just a bias vector in the weights, not a Linear layer.
+        self.ssm_dt_bias = Tensor.empty(ssm.num_v_heads)
         self.ssm_a = Tensor.zeros(ssm.num_v_heads)
         self.ssm_norm = nn.RMSNorm(self.head_dim, config.norm_eps)
         self.ssm_out = nn.Linear(ssm.inner_size, config.dim, bias=False)
@@ -115,34 +95,22 @@ class GatedDeltaNetBlock(FFNBlock):
     def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
         B, T = x.shape[0], x.shape[1]
         z = self.attn_gate(x)
-        # Compute Delta Rule gating terms
         beta = self.ssm_beta(x).sigmoid().reshape(B, self.ssm.num_v_heads, 1)
-        # alpha provides decay/erasure (Gated Mamba2 logic)
-        alpha = (-self.ssm_a.exp() * (self.ssm_alpha(x) + self.ssm_dt.bias).softplus()).exp().reshape(B, self.ssm.num_v_heads, 1, 1)
-        
-        # Local context processing (Local Attention replacement)
+        # Use ssm_dt_bias directly
+        alpha = (-self.ssm_a.exp() * (self.ssm_alpha(x) + self.ssm_dt_bias).softplus()).exp().reshape(B, self.ssm.num_v_heads, 1, 1)
         conv_window = self.conv_state.cat(self.attn_qkv(x).transpose(1, 2), dim=2)
-        conv_out = (conv_window * self.ssm_conv1d.weight.unsqueeze(0)).sum(2).silu()
-        
+        conv_out = (conv_window * self.ssm_conv1d_weight).sum(2).silu()
         q, k, v = conv_out.split([self.ssm.num_qk_heads*self.head_dim, self.ssm.num_qk_heads*self.head_dim, self.ssm.num_v_heads*self.head_dim], dim=1)
-        # L2-Norm is crucial for stability in Linear Attention (Ref: Gated DeltaNet paper)
         q = q.reshape(B, self.ssm.num_qk_heads, self.head_dim).normalize(axis=-1)
         k = k.reshape(B, self.ssm.num_qk_heads, self.head_dim).normalize(axis=-1)
         v = v.reshape(B, self.ssm.num_v_heads, self.head_dim)
-        
         q = q.repeat_interleave(self.ssm.num_v_heads // self.ssm.num_qk_heads, axis=1)
         k = k.repeat_interleave(self.ssm.num_v_heads // self.ssm.num_qk_heads, axis=1)
-        
-        # Delta Rule Recurrent update for associative memory matrix S
         S = self.recurrent_state * alpha
         retrieved = (S * k.unsqueeze(-1)).sum(axis=-2) 
         delta = (v - retrieved) * beta
         new_S = S + k.unsqueeze(-1) * delta.unsqueeze(-2)
-        
-        # In-place state updates
         recurrent_state = Tensor(self.recurrent_state.uop.after(self.recurrent_state.uop.store(new_S.cast(self.recurrent_state.dtype).uop), self.conv_state.uop.store(conv_window[:, :, 1:].cast(self.conv_state.dtype).uop)))
-        
-        # Linear projection and gating
         output = (new_S * q.unsqueeze(-1)).sum(axis=-2) / (self.head_dim**0.5)
         return self.ssm_out(self.ssm_norm(output).reshape(B, T, -1) * z.silu())
 
@@ -156,8 +124,6 @@ class Transformer:
         trace(f"Transformer.__init__ for {config.num_blocks} blocks.")
         self.blk = []
         for i in range(config.num_blocks):
-            # HYBRID PATTERN: Interleave 3 Linear Attention layers with 1 Softmax Attention layer.
-            # Ref: "An Overnight Stack for Qwen3.6-27B" (April 2026)
             if config.ssm and (i + 1) % 4 != 0:
                 self.blk.append(GatedDeltaNetBlock(config, config.ssm))
             else:
@@ -177,22 +143,21 @@ class Transformer:
         from tinygrad.nn.state import safe_load
         state_dict = safe_load(str(gguf))
         arch = 'qwen3.6'
-        # Derived metadata based on 'gemini.txt' header dump analysis.
         kv = {
             'general.architecture': arch, 
             f'{arch}.context_length': max_context or 32768,
             f'{arch}.embedding_length': 5120,
             f'{arch}.feed_forward_length': 17408,
             f'{arch}.block_count': 64,
-            f'{arch}.attention.head_count': 24, # (Standard layers: 24*256 = 6144)
-            f'{arch}.attention.head_count_kv': 4, # (GQA: 4*256 = 1024)
+            f'{arch}.attention.head_count': 24, 
+            f'{arch}.attention.head_count_kv': 4, 
             f'{arch}.attention.layer_norm_rms_epsilon': 1e-6,
             f'{arch}.rope.freq_base': 1000000.0,
-            f'{arch}.rope.dimension_count': 64, # Partial RoPE
+            f'{arch}.rope.dimension_count': 64,
             f'{arch}.ssm.conv_kernel': 4,
             f'{arch}.ssm.state_size': 16,
-            f'{arch}.ssm.num_qk_heads': 16, # From [10240] dump split (16*128*2)
-            f'{arch}.ssm.num_v_heads': 48, # From [10240] dump split (48*128)
+            f'{arch}.ssm.num_qk_heads': 16,
+            f'{arch}.ssm.num_v_heads': 48,
             f'{arch}.ssm.inner_size': 6144,
         }
 
@@ -209,8 +174,8 @@ class Transformer:
                 '.linear_attn.in_proj_a.weight': '.ssm_alpha.weight',
                 '.linear_attn.in_proj_b.weight': '.ssm_beta.weight',
                 '.linear_attn.A_log': '.ssm_a',
-                '.linear_attn.dt_bias': '.ssm_dt.bias',
-                '.linear_attn.conv1d.weight': '.ssm_conv1d.weight',
+                '.linear_attn.dt_bias': '.ssm_dt_bias', # Explicitly match new Tensor name
+                '.linear_attn.conv1d.weight': '.ssm_conv1d_weight',
                 '.linear_attn.norm.weight': '.ssm_norm.weight',
                 '.linear_attn.out_proj.weight': '.ssm_out.weight',
                 '.self_attn.q_proj.weight': '.attn_q.weight',
