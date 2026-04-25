@@ -90,35 +90,47 @@ class Transformer:
         trace("Loading state dict from path...")
         kv = nn.state.safe_load(path)
         
-        # LEARNING POINT 11: MOCK VOCABULARY ROBUSTNESS
-        # The KeyError: b'<' happened because the mock vocab lacked raw byte tokens 
-        # and the specific chat template strings used by tinygrad/llm/cli.py.
+        # RESOURCE: tinygrad/llm/cli.py SimpleTokenizer.__init__ 
+        # This function expects tokens to be strings that can be re-mapped back to bytes 
+        # using a specific 'byte_encoder' (mapping bytes 0-255 to Unicode characters).
         if "tokenizer.ggml.tokens" not in kv:
-            trace("Injecting robust GGUF-compatible tokenizer metadata.")
+            trace("Injecting GPT-2 compatible tokenizer metadata.")
             vocab_size = 248320
-            tokens = [f"token_{i}" for i in range(vocab_size)]
             
-            # 1. Byte tokens (0-255) ensure no character (like '<') causes a KeyError
-            for i in range(256): tokens[i] = bytes([i]).decode('latin-1')
+            # Recreate the GPT-2 byte->char mapping used in tinygrad's SimpleTokenizer
+            bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+            cs = bs[:]
+            n = 0
+            for b in range(256):
+                if b not in bs:
+                    bs.append(b)
+                    cs.append(256 + n)
+                    n += 1
+            byte_encoder = dict(zip(bs, [chr(n) for n in cs]))
             
-            kv["tokenizer.ggml.tokens"] = tokens
+            # Create a mock vocabulary where every token is a valid string for the decoder
+            # We use 'token_...' but ensure the characters are from the byte_encoder set.
+            kv["tokenizer.ggml.tokens"] = [f"t{i}" for i in range(vocab_size)]
+            
+            # Map raw bytes 0-255 to their "Unicode" string equivalent
+            for i in range(256):
+                kv["tokenizer.ggml.tokens"][i] = byte_encoder[i]
+            
             kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
             kv["tokenizer.ggml.scores"] = [0.0] * vocab_size
             kv["tokenizer.ggml.pre"] = "llama3" 
             kv["tokenizer.ggml.model"] = "llama" 
 
-            # 2. Inject explicit chat headers required by tinygrad's MODEL=qwen2 CLI template
+            # Map critical chat tokens
             special_tokens = {
-                151643: "<|endoftext|>",
-                151644: "<|im_start|>",
-                151645: "<|im_end|>",
-                151646: "<|start_header_id|>",
-                151647: "<|end_header_id|>"
+                151643: "<|endoftext|>", 151644: "<|im_start|>", 151645: "<|im_end|>",
+                151646: "<|start_header_id|>", 151647: "<|end_header_id|>"
             }
             for idx, string in special_tokens.items():
                 kv["tokenizer.ggml.tokens"][idx] = string
-                kv["tokenizer.ggml.token_type"][idx] = 4 # Special token type
+                kv["tokenizer.ggml.token_type"][idx] = 4
 
+        # Metadata to satisfy cli.py requirements
         if "general.architecture" not in kv: kv["general.architecture"] = "qwen2"
         if "tokenizer.ggml.bos_token_id" not in kv: kv["tokenizer.ggml.bos_token_id"] = 151643
         if "tokenizer.ggml.eos_token_id" not in kv: kv["tokenizer.ggml.eos_token_id"] = 151643
