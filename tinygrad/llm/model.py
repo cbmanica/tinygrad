@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, itertools, pathlib, sys
+import functools, itertools, pathlib, sys, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, Context, Device
 from tinygrad.llm.gguf import gguf_load
@@ -161,7 +161,8 @@ class Transformer:
         block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
         self.blk = []
         for i in range(config.num_blocks):
-            target = "METAL" if i >= 40 else "AMD:0"
+            # Dynamic target based on layer count
+            target = "METAL" if i >= (config.num_blocks - 8) else "AMD:0"
             trace(f"Creating block {i} on {target}")
             with Context(DEV=target):
                 self.blk.append(GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else block_cls(dense_config if i < config.leading_dense_blocks else config))
@@ -188,20 +189,18 @@ class Transformer:
         if path_str.endswith(".safetensors"):
             trace("Detected Safetensors format, loading via safe_load")
             from tinygrad.nn.state import safe_load
-            # Load metadata/weights into CPU memory first to avoid GPU OOM
             with Context(DEV="CPU"):
                 state_dict = safe_load(path_str)
-                # Safetensors usually doesn't have the KV metadata GGUF does
-                # We'll mock the minimal KV dict needed for the config
                 kv = {
-                    'general.architecture': 'qwen2', # Assuming Qwen2-style for 27B
+                    'general.architecture': 'qwen2', 
                     'qwen2.context_length': max_context or 32768,
-                    'qwen2.attention.head_count': 32, # Verify these for 27B
+                    'qwen2.attention.head_count': 32,
                     'qwen2.attention.head_count_kv': 32,
-                    'qwen2.embedding_length': 5120,
-                    'qwen2.block_count': 40,
+                    'qwen2.embedding_length': 4096, # 27B Hybrid Default
+                    'qwen2.feed_forward_length': 17408, # 27B Hybrid Default
+                    'qwen2.block_count': 64, # 27B Hybrid Default
                     'qwen2.attention.layer_norm_rms_epsilon': 1e-6,
-                    'tokenizer.ggml.tokens': [""] * 152064, # Mock vocab size
+                    'tokenizer.ggml.tokens': [""] * 248320, 
                     'qwen2.rope.freq_base': 1000000.0,
                 }
         else:
@@ -209,21 +208,97 @@ class Transformer:
             kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
         trace(f"Load finished. Keys in state_dict: {len(state_dict)}")
+        
+        if path_str.endswith(".safetensors"):
+            trace("Normalizing Safetensors keys to GGUF format")
+            new_sd = {}
+            for k, v in state_dict.items():
+                nk = k.replace('model.embed_tokens.weight', 'token_embd.weight') \
+                      .replace('model.norm.weight', 'output_norm.weight') \
+                      .replace('lm_head.weight', 'output.weight') \
+                      .replace('model.layers.', 'blk.') \
+                      .replace('language_blk.', '') \
+                      .replace('.input_layernorm.', '.attn_norm.') \
+                      .replace('.post_attention_layernorm.', '.ffn_norm.') \
+                      .replace('.self_attn.q_proj.', '.attn_q.') \
+                      .replace('.self_attn.k_proj.', '.attn_k.') \
+                      .replace('.self_attn.v_proj.', '.attn_v.') \
+                      .replace('.self_attn.o_proj.', '.attn_output.') \
+                      .replace('.mlp.gate_proj.', '.ffn_gate.') \
+                      .replace('.mlp.up_proj.', '.ffn_up.') \
+                      .replace('.mlp.down_proj.', '.ffn_down.')
+                new_sd[nk] = v
+            state_dict = new_sd
+
         state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
-        if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
-        arch = kv['general.architecture']
-        max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
-        n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
-        ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')}) if arch in ('qwen35', 'qwen35moe') else None
-        if arch in ('qwen35', 'qwen35moe', 'glm4moe'): state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
-        head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
-        config = TransformerConfig(num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'], hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)), n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'], vocab_size=len(kv['tokenizer.ggml.tokens']), head_dim=head_dim, rope_theta=kv[f'{arch}.rope.freq_base'], rope_dim=kv.get(f'{arch}.rope.dimension_count', head_dim), v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)), max_context=max_context, qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0, num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0), norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe')), kv_lora_rank=kv.get(f'{arch}.attention.kv_lora_rank', 0), q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0), leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0), shared_expert_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)), shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict, dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0, routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm, full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0), qkv_bias='blk.0.attn_q.bias' in state_dict, expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+        
+        if 'output.weight' not in state_dict:
+            emb_key = 'token_embd.weight' if 'token_embd.weight' in state_dict else 'model.embed_tokens.weight'
+            trace(f"Generating output.weight from {emb_key}")
+            state_dict['output.weight'] = state_dict[emb_key]
+
+        arch = kv.get('general.architecture', 'qwen2') 
+        trace(f"Using architecture: {arch}")
+
+        max_context = min(max_context, kv.get(f'{arch}.context_length', 32768)) if max_context is not None else kv.get(f'{arch}.context_length', 32768)
+        n_heads = kv.get(f'{arch}.attention.head_count', 32)
+        n_kv_heads = kv.get(f'{arch}.attention.head_count_kv', 32)
+        
+        ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')}) if arch in ('qwen35', 'qwen35moe') and f'{arch}.ssm.conv_kernel' in kv else None
+        
+        if arch in ('qwen35', 'qwen35moe', 'glm4moe'): 
+            state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
+        
+        embedding_length = kv.get(f'{arch}.embedding_length', 4096)
+        hidden_dim = kv.get(f'{arch}.feed_forward_length', 17408)
+        num_blocks = kv.get(f'{arch}.block_count', 64)
+        head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', embedding_length // n_heads))
+
+        trace(f"Configuring model: dim={embedding_length}, hidden_dim={hidden_dim}, blocks={num_blocks}")
+
+        config = TransformerConfig(
+            num_blocks=num_blocks, 
+            dim=embedding_length, 
+            hidden_dim=hidden_dim, 
+            n_heads=n_heads, 
+            n_kv_heads=n_kv_heads, 
+            norm_eps=kv.get(f'{arch}.attention.layer_norm_rms_epsilon', 1e-6), 
+            vocab_size=len(kv.get('tokenizer.ggml.tokens', [""] * 248320)), 
+            head_dim=head_dim, 
+            rope_theta=kv.get(f'{arch}.rope.freq_base', 1000000.0), 
+            rope_dim=kv.get(f'{arch}.rope.dimension_count', head_dim), 
+            v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)), 
+            max_context=max_context, 
+            qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0, 
+            num_experts=kv.get(f'{arch}.expert_count', 0), 
+            num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0), 
+            norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe')), 
+            kv_lora_rank=kv.get(f'{arch}.attention.kv_lora_rank', 0), 
+            q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0), 
+            leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0), 
+            shared_expert_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', 0), 
+            shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict, 
+            dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0, 
+            routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), 
+            attn_output_gate=arch in ('qwen35', 'qwen35moe'), 
+            ssm=ssm, 
+            full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0), 
+            qkv_bias='blk.0.attn_q.bias' in state_dict, 
+            expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict
+        )
+
         model = Transformer(config)
         trace("Mapping weights to devices manually...")
         new_state_dict = {}
         for k, v in state_dict.items():
-            target = ("METAL" if int(k.split(".")[1]) >= 40 else "AMD:0") if "blk." in k else "AMD:0"
+            target = "AMD:0"
+            layer_match = re.search(r'blk\.(\d+)', k)
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+                # Offload only the top 8 layers to METAL as requested
+                if layer_idx >= (num_blocks - 8): target = "METAL"
             new_state_dict[k] = v.to(target)
+            
         trace("Calling nn.state.load_state_dict")
         nn.state.load_state_dict(model, new_state_dict, verbose=False, consume=True, realize=False)
         if realize:
@@ -236,8 +311,7 @@ class Transformer:
     def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
         trace(f"Generation started (temp={temperature})")
         v_start_pos, v_toks, temp = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size), Tensor(temperature).contiguous()
-        t, start_pos = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context), self.get_start_pos(tokens)
-        if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
+        t, start_pos = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context), 0
         out, prompt_len = None, len(tokens)
         while len(tokens) < self.max_context:
             sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
@@ -245,5 +319,4 @@ class Transformer:
             start_pos += nt.val
             if start_pos < len(tokens): continue
             tokens.append(int(out.item()))
-            self._cached_tokens = tokens[:-1]
             yield tokens[-1]
