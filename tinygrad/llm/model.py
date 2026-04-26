@@ -101,7 +101,7 @@ class Transformer:
     def __call__(self, tokens: Tensor, start_pos: int):
         h = self.token_embd(tokens)
         h_data = h.numpy()
-        trace(f"Input Embeddings: mean={h_data.mean():.4f}, max={h_data.max():.4f}")
+        trace(f"Input Embeddings: mean={h_data.mean():.6f}, max={h_data.max():.6f}")
 
         for i, layer in enumerate(self.layers):
             layer_dev = layer["mlp"].up_proj.weight.device
@@ -115,14 +115,14 @@ class Transformer:
             
             if (i + 1) % 16 == 0:
                 stats = h.numpy()
-                trace(f"Layer {i} stats: mean={stats.mean():.4f}, max={stats.max():.4f}")
+                trace(f"Layer {i} stats: mean={stats.mean():.6f}, max={stats.max():.6f}")
                 h = h.realize()
 
         if h.device != "CPU": h = h.realize().to("CPU").realize()
         out_normed = self.output_norm(h)
         logits = self.output(out_normed).realize()
         l_np = logits.numpy()
-        trace(f"Logits: mean={l_np.mean():.4f}, max={l_np.max():.4f}, argmax={l_np[0, -1].argmax()}")
+        trace(f"Logits: mean={l_np.mean():.6f}, max={l_np.max():.6f}, argmax={l_np[0, -1].argmax()}")
         return logits
 
     def generate(self, tokens: list[int]):
@@ -141,9 +141,12 @@ class Transformer:
     @staticmethod
     def from_gguf(path: pathlib.Path, max_context: int):
         trace(f"Opening {path}")
+        # ADVANCED TRACE: Inspect file size
+        trace(f"File size: {path.stat().st_size / 1024**3:.2f} GB")
+        
         kv = nn.state.safe_load(path)
         
-        # Vocab setup
+        # Vocab setup logic
         if "tokenizer.ggml.tokens" not in kv:
             trace("Reconstructing vocabulary...")
             vocab_size = 248320
@@ -166,55 +169,52 @@ class Transformer:
         config = TransformerConfig(64, 5120, 17408, 48, 4, 1e-6, 248320, 256, 1000000.0, 128, 256, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
         model = Transformer(config)
         
-        trace("Mapping model state dict...")
+        trace(f"Mapping model state dict (Found {len(kv)} keys)...")
         new_sd = {}
         
-        # DEFINITIVE FIX: Explicit Key-to-Key mapping for non-prefixed and prefixed keys
-        # We process keys in two passes: direct matching, then prefix cleaning.
         for k, v in kv.items():
+            if not isinstance(v, Tensor): continue
             if k.startswith("tokenizer."): continue
             
-            # 1. Handle explicit full-path keys first (No guessing)
-            if k == 'model.language_model.embed_tokens.weight': 
-                new_sd['token_embd.weight'] = v
-                trace(f"MAP SUCCESS: {k} -> token_embd.weight")
-                continue
-            if k == 'model.language_model.norm.weight':
-                new_sd['output_norm.weight'] = v
-                trace(f"MAP SUCCESS: {k} -> output_norm.weight")
-                continue
-            if k == 'lm_head.weight':
-                new_sd['output.weight'] = v
-                trace(f"MAP SUCCESS: {k} -> output.weight")
-                continue
-
-            # 2. For layers, use sequential stripping
             clean_k = k
             for p in ["model.language_model.", "language_model.", "model."]:
                 if clean_k.startswith(p):
                     clean_k = clean_k[len(p):]
             
-            # Double check for embed/norm/head in case of unexpected prefixes
+            # Key Translation
             if clean_k == 'embed_tokens.weight': clean_k = 'token_embd.weight'
             elif clean_k == 'norm.weight': clean_k = 'output_norm.weight'
             elif clean_k == 'lm_head.weight': clean_k = 'output.weight'
             
-            new_sd[clean_k] = v
+            # DIAGNOSTIC: Force data check on EMBEDDING specifically
+            if clean_k == 'token_embd.weight':
+                trace(f"DEBUG: Checking {k} -> {v.shape} ({v.dtype})")
+                try:
+                    # Check if buffer even exists
+                    buf = v.lazydata.base.realized if hasattr(v.lazydata, 'base') else None
+                    trace(f"DEBUG: LazyData realized? {buf is not None}")
+                    
+                    # Force read a slice to bypass global realization issues
+                    v_slice = v[0, :10].realize().numpy()
+                    trace(f"DEBUG: First 10 values of {k}: {v_slice}")
+                    
+                    # If slice is zeros, the mapping from safetensors is broken
+                    if v_slice.any():
+                        trace("DEBUG: SUCCESS! Non-zero values detected in slice.")
+                    else:
+                        trace("DEBUG: CRITICAL - Slice is zero. Safetensors read failed.")
+                except Exception as e:
+                    trace(f"DEBUG: Slice read CRASHED: {e}")
 
-        # DIAGNOSTIC: Verify new_sd before loading
-        if 'token_embd.weight' not in new_sd:
-            trace("CRITICAL ERROR: token_embd.weight missing from mapped state dict!")
-        else:
-            # We don't call .numpy() here to avoid the Ops.MUL crash if not realized
-            trace("SUCCESS: token_embd.weight present in mapping.")
+            # Force realization to CPU to ensure values are persistent
+            v_real = v.to("CPU").realize()
+            new_sd[clean_k] = v_real
 
+        trace(f"Loading {len(new_sd)} layers into model structure...")
         nn.state.load_state_dict(model, new_sd, consume=True)
         
-        # Post-load realization check
-        try:
-            emb_mean = model.token_embd.weight.realize().numpy().mean()
-            trace(f"Verification - model.token_embd.weight mean: {emb_mean:.6f}")
-        except Exception as e:
-            trace(f"Verification failed: {e}")
+        # Final Verification
+        final_emb_mean = model.token_embd.weight.numpy().mean()
+        trace(f"FINAL Model Embedding mean: {final_emb_mean:.6f}")
             
         return model, kv
