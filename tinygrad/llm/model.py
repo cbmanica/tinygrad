@@ -8,7 +8,7 @@ from tinygrad import Tensor, nn, dtypes, Device, Context
 GPU_DEVICE = "METAL" if "METAL" in Device._devices else "AMD"
 
 def trace(msg):
-    # Restored high-precision timestamps for debugging loop hangs
+    # High-precision timestamps for debugging loop hangs
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] --- [TRACE] {msg} ---")
     sys.stdout.flush()
@@ -99,7 +99,7 @@ class Transformer:
             elif "linear_attn" in layer: h = h + layer["linear_attn"](layer["input_layernorm"](h), start_pos)
             h = (h + layer["mlp"](layer["post_attention_layernorm"](h)))
             
-            if (i + 1) % 8 == 0: h = h.realize() # Clears lazy graph to prevent hangs
+            if (i + 1) % 8 == 0: h = h.realize()
 
         if h.device != "CPU":
             h = h.realize().to("CPU").realize()
@@ -113,7 +113,6 @@ class Transformer:
             logits = self(curr_tokens, start_pos)
             trace("Calculating argmax...")
             t0 = time.perf_counter()
-            # Explicitly realize index before numpy() to prevent async hangs
             tok_tensor = logits[0, -1].argmax().realize()
             next_token = int(tok_tensor.numpy())
             trace(f"Next token [{next_token}] identified in {(time.perf_counter()-t0)*1000:.2f}ms")
@@ -128,19 +127,40 @@ class Transformer:
         trace(f"Opening {path}")
         kv = nn.state.safe_load(path)
         
-        # RESTORED: Proper metadata for SimpleTokenizer
-        if "tokenizer.ggml.pre" not in kv:
-            kv["tokenizer.ggml.pre"] = "qwen2"
+        # Proper vocabulary handling: Only reconstruct if tokens are missing
         if "tokenizer.ggml.tokens" not in kv:
+            trace("Warning: Vocabulary missing from safetensors. Reconstructing...")
             vocab_size = 248320
-            kv.update({"tokenizer.ggml.tokens": [f"t{i}" for i in range(vocab_size)], 
-                       "tokenizer.ggml.token_type": [1]*vocab_size, "tokenizer.ggml.scores": [0.0]*vocab_size})
+            # Standard byte-to-char mapping for Qwen/GPT-style tokenizers
+            bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+            cs = bs[:]
+            n = 0
+            for b in range(256):
+                if b not in bs: bs.append(b); cs.append(256 + n); n += 1
+            byte_encoder = dict(zip(bs, [chr(n) for n in cs]))
+            kv["tokenizer.ggml.tokens"] = [byte_encoder.get(i, f"t{i}") for i in range(vocab_size)]
+            kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
+            kv["tokenizer.ggml.scores"] = [0.0] * vocab_size
+            
+        # Ensure critical metadata for cli.py's SimpleTokenizer
+        kv.update({
+            "tokenizer.ggml.pre": "qwen2",
+            "general.architecture": "qwen2",
+            "tokenizer.ggml.model": "gpt2"
+        })
+        
+        # Manually verify/inject Qwen special tokens into the list to prevent "KeyError: b'<'"
+        # Qwen2 template uses these specifically
+        special_map = {151643: "<|endoftext|>", 151644: "<|im_start|>", 151645: "<|im_end|>"}
+        for idx, name in special_map.items():
+            if idx < len(kv["tokenizer.ggml.tokens"]):
+                kv["tokenizer.ggml.tokens"][idx] = name
+                kv["tokenizer.ggml.token_type"][idx] = 4 # Mark as special
 
         config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 512, 1000000.0, 128, 512, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
         model = Transformer(config)
         
         trace("Mapping and Loading weights...")
-        # Sanitize keys for the model but keep 'kv' intact for the tokenizer
         new_sd = {re.sub(r'^(model\.)?(language_model\.)?', '', k): v for k, v in kv.items() if not k.startswith("tokenizer.")}
         mapping = {'embed_tokens.weight': 'token_embd.weight', 'lm_head.weight': 'output.weight', 'norm.weight': 'output_norm.weight'}
         for old, new in mapping.items():
@@ -148,7 +168,6 @@ class Transformer:
         
         nn.state.load_state_dict(model, new_sd, consume=True)
 
-        # Warm-up: Ensure the Metal/AMD drivers are initialized
         trace("Warming up GPU context...")
         dummy = Tensor.ones(1, 1, 5120, device="CPU").to(GPU_DEVICE).realize()
         del dummy
