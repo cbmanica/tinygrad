@@ -14,10 +14,14 @@ def trace(msg):
 
 def apply_rope(x: Tensor, start_pos: int, head_dim: int, theta: float) -> Tensor:
     dim = x.shape[-1]
+    # Calculate frequencies
     freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2, device=x.device)[:(dim // 2)] / dim))
     t = Tensor.arange(start_pos, start_pos + x.shape[1], device=x.device)
-    freqs = t.unsqueeze(1) * freqs.unsqueeze(0)
-    cos, sin = freqs.cos(), freqs.sin()
+    freqs = t.unsqueeze(1) * freqs.unsqueeze(0) # (seq_len, dim//2)
+    
+    # FIX: Reshape to (1, seq_len, 1, dim//2) to broadcast across batch (1) and heads (48)
+    cos, sin = freqs.cos().reshape(1, x.shape[1], 1, -1), freqs.sin().reshape(1, x.shape[1], 1, -1)
+    
     x1, x2 = x.chunk(2, dim=-1)
     return Tensor.cat(x1 * cos - x2 * sin, x1 * sin + x2 * cos, dim=-1)
 
@@ -29,17 +33,11 @@ class SSMConfig:
 class TransformerConfig:
     """
     ARCHITECTURAL LESSONS FOR QWEN 3.6-27B:
-    1. head_dim: 256. (512 causes RMSNorm mismatches).
-    2. n_heads: 48 for Q (12288 dim).
-    3. n_kv_heads: 4 (1024 dim).
-    4. o_proj: Expects (5120, 6144), implying a 24-head output bottleneck.
-    5. dim: 5120.
-    
-    TOKENIZER LESSONS:
-    - Reconstructing vocab from .safetensors requires BOTH special tokens AND byte-mappings.
-    - SimpleTokenizer DOES NOT take raw bytes (e.g. b'\x00'). It expects strings of 
-      mapped unicode characters (bytes_to_unicode). 
-    - Providing raw bytes causes "KeyError: 0" in SimpleTokenizer.__init__.
+    1. SSM Projection: in_proj_qkv is 10240, NOT 12288.
+    2. Gating: Gate (z) is 6144. Output of 10240-path must be sliced to 6144 to match z.
+    3. head_dim: 256 (split to 128 for RoPE application).
+    4. n_heads: 48 for Q (12288 dim).
+    5. n_kv_heads: 4 (1024 dim).
     """
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
     norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
@@ -63,7 +61,7 @@ class SSMBlock:
         qkv = self.in_proj_qkv(x)
         z = self.in_proj_z(x).silu()
         x_conv = self.conv1d(qkv.transpose(1, 2)).transpose(1, 2)[:, :x.shape[1], :]
-        return self.out_proj(x_conv.chunk(2, dim=-1)[0] * z)
+        return self.out_proj(x_conv[:, :, :6144] * z)
 
 class AttentionBlock:
     def __init__(self, config: TransformerConfig):
@@ -132,6 +130,7 @@ class Transformer:
             logits = self(curr_tokens, start_pos)
             tok_tensor = logits[0, -1].argmax().realize()
             next_token = int(tok_tensor.numpy())
+            trace(f"Generated token: {next_token}")
             yield next_token
             start_pos += curr_tokens.shape[1]
             curr_tokens = Tensor([[next_token]], device="CPU")
@@ -147,8 +146,6 @@ class Transformer:
             vocab_size = 248320
             tokens = [f"t{i}" for i in range(vocab_size)]
             
-            # SimpleTokenizer expects bytes mapped to specific unicode characters
-            # This is the standard GPT-2 byte encoder used in Qwen2/tinygrad
             bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
             cs = bs[:]
             n = 0
@@ -158,12 +155,9 @@ class Transformer:
                     cs.append(2**8 + n)
                     n += 1
             byte_decoder = {b: chr(c) for b, c in zip(bs, cs)}
-            
             for i in range(256): tokens[i] = byte_decoder[i]
             
-            # Special tokens MUST be plain strings
             tokens[151643], tokens[151644], tokens[151645] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
-            
             kv["tokenizer.ggml.tokens"] = tokens
             kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
             for i in [151643, 151644, 151645]: kv["tokenizer.ggml.token_type"][i] = 4
