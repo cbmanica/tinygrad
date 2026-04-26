@@ -30,7 +30,10 @@ class SSMConfig:
 class TransformerConfig:
     num_blocks: int = 64; dim: int = 5120; hidden_dim: int = 17408; n_heads: int = 24; n_kv_heads: int = 4; 
     norm_eps: float = 1e-6; vocab_size: int = 248320; head_dim: int = 256; rope_theta: float = 1000000.0; 
-    ssm: SSMConfig = SSMConfig(); offload_layers: int = 32 
+    ssm: SSMConfig = SSMConfig()
+    # 27B model in int8 = ~27GB. 
+    # Your AMD card is 24GB. You MUST offload fewer layers or use more CPU.
+    offload_layers: int = 24 
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -81,18 +84,17 @@ class FFNBlock:
 class Transformer:
     def __init__(self, config: TransformerConfig):
         self.config = config
-        with Context(DEV="CPU"): self.token_embd = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = []
-        for i in range(config.num_blocks):
-            target_dev = "AMD" if i < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
-            with Context(DEV=target_dev):
+        # STEP 1: Always init weights on CPU to save VRAM for the loader
+        with Context(DEV="CPU"):
+            self.token_embd = nn.Embedding(config.vocab_size, config.dim)
+            self.layers = []
+            for i in range(config.num_blocks):
                 layer = {"input_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "post_attention_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "mlp": FFNBlock(config.dim, config.hidden_dim)}
                 if (i + 1) % 4 == 0: layer["self_attn"] = AttentionBlock(config)
                 else: layer["linear_attn"] = SSMBlock(config)
                 self.layers.append(layer)
-        with Context(DEV="CPU"):
             self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
             self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -113,22 +115,23 @@ class Transformer:
 
     @staticmethod
     def load_quantized(path: pathlib.Path, config: TransformerConfig):
-        # DIAGNOSTIC NOTE: The error at 8% suggests the allocator is hitting a wall during the replace transition.
-        # We MUST ensure the source tensor is fully realized on CPU before even touching the AMD card.
         trace(f"Loading unified safetensors: {path}")
         kv = nn.state.safe_load(path)
         model = Transformer(config)
         model_sd = nn.state.get_state_dict(model)
         
-        trace("Directly mapping weights. AMD VRAM Fencing enabled.")
+        trace("Directly mapping weights. MEMORY LESSON: replace() requires 2x weight size during swap.")
+        
         for k in tqdm(kv.keys()):
             if k.endswith("_scale"): continue
             
-            # DIAGNOSTIC: Calculate memory before current weight
-            amd_used = GlobalCounters.mem_used_per_device.get("AMD", 0) / 1e9
-
-            # STEP 1: Process strictly on CPU. realize() here is the fence.
-            # This makes sure the de-quantization math isn't lazy and doesn't get pushed to the GPU graph later.
+            # Identify target device
+            target_dev = "CPU"
+            if k.startswith("layers."):
+                layer_idx = int(k.split(".")[1])
+                target_dev = "AMD" if layer_idx < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
+            
+            # STEP 1: Dequantize to CPU RAM first
             with Context(DEV="CPU"):
                 v_raw = kv[k].to("CPU").realize()
                 if v_raw.dtype == dtypes.char and f"{k}_scale" in kv:
@@ -137,31 +140,27 @@ class Transformer:
                 else:
                     v_final = v_raw.realize()
 
-            # STEP 2: Logic for target device
-            target_dev = "CPU"
-            if k.startswith("layers."):
-                layer_idx = int(k.split(".")[1])
-                target_dev = "AMD" if layer_idx < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
-            
-            # STEP 3: The "Memory-Fence" transfer.
-            # We call realize() after to(target_dev) to force the transfer to happen NOW.
+            # STEP 2: The Swap Logic
             if k in model_sd:
                 try:
-                    # DIAGNOSTIC: Is this weight specifically causing the OOM?
-                    if amd_used > 22.0: # Close to the 23.57 GB limit
-                        trace(f"DANGER: Low VRAM. Key: {k}, AMD: {amd_used:.2f}GB. Forcing GC.")
+                    # Check VRAM usage
+                    amd_mem = GlobalCounters.mem_used_per_device.get("AMD", 0) / 1e9
+                    if target_dev == "AMD" and amd_mem > 21.0:
+                        trace(f"VRAM PRESSURE: {amd_mem:.2f}GB. Clearing cache before loading {k}...")
                         gc.collect()
 
-                    # Direct buffer replacement
+                    # Move to GPU and replace the CPU-dummy parameter
+                    # This is the line where the OOM occurs because replace() allocates before freeing
                     model_sd[k].replace(v_final.to(target_dev).realize()).realize()
                     
-                except MemoryError as e:
-                    trace(f"CRITICAL OOM on Key: {k}. Size: {v_final.nbytes/1e6:.2f}MB. AMD Used: {amd_used:.2f}GB")
-                    raise e
+                except MemoryError:
+                    amd_mem = GlobalCounters.mem_used_per_device.get("AMD", 0) / 1e9
+                    sz = (v_final.numel() * v_final.dtype.itemsize) / 1e6
+                    trace(f"FATAL OOM: Could not swap {k} ({sz:.1f}MB) into AMD (Current: {amd_mem:.2f}GB)")
+                    trace("FIX: Set config.offload_layers to a LOWER number in test_load.py")
+                    raise
             
-            # STEP 4: Aggressive cleanup. Delete local refs to tensors we just loaded.
             del v_raw, v_final
-            if "scale" in locals(): del scale
             
-        trace("Load completed successfully.")
+        trace("Load complete.")
         return model
