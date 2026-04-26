@@ -19,7 +19,7 @@ def apply_rope(x: Tensor, start_pos: int, head_dim: int, theta: float) -> Tensor
     t = Tensor.arange(start_pos, start_pos + x.shape[1], device=x.device)
     freqs = t.unsqueeze(1) * freqs.unsqueeze(0) # (seq_len, dim//2)
     
-    # FIX: Reshape to (1, seq_len, 1, dim//2) to broadcast across batch (1) and heads (48)
+    # Reshape for broadcasting
     cos, sin = freqs.cos().reshape(1, x.shape[1], 1, -1), freqs.sin().reshape(1, x.shape[1], 1, -1)
     
     x1, x2 = x.chunk(2, dim=-1)
@@ -31,14 +31,6 @@ class SSMConfig:
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    """
-    ARCHITECTURAL LESSONS FOR QWEN 3.6-27B:
-    1. SSM Projection: in_proj_qkv is 10240, NOT 12288.
-    2. Gating: Gate (z) is 6144. Output of 10240-path must be sliced to 6144 to match z.
-    3. head_dim: 256 (split to 128 for RoPE application).
-    4. n_heads: 48 for Q (12288 dim).
-    5. n_kv_heads: 4 (1024 dim).
-    """
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
     norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
     rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; 
@@ -68,7 +60,7 @@ class AttentionBlock:
         self.config = config
         self.q_proj = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False) 
         self.q_norm = nn.RMSNorm(config.head_dim, config.norm_eps) 
         self.k_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
         self.o_proj = nn.Linear(6144, config.dim, bias=False)
@@ -80,8 +72,10 @@ class AttentionBlock:
         q = apply_rope(q, start_pos, self.config.head_dim, self.config.rope_theta)
         k = apply_rope(k, start_pos, self.config.head_dim, self.config.rope_theta)
         attn = (q @ k.transpose(-2, -1)) / (self.config.head_dim ** 0.5)
-        out = (attn.softmax(-1) @ v.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim)).reshape(x.shape[0], x.shape[1], -1)
-        return self.o_proj(out)
+        
+        v = v.reshape(x.shape[0], x.shape[1], self.config.n_kv_heads, self.config.head_dim)
+        out = (attn.softmax(-1) @ v).reshape(x.shape[0], x.shape[1], -1)
+        return self.o_proj(out[:, :, :6144])
 
 class FFNBlock:
     def __init__(self, dim: int, hidden_dim: int):
