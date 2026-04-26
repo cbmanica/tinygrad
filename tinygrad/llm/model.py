@@ -141,12 +141,10 @@ class Transformer:
     @staticmethod
     def from_gguf(path: pathlib.Path, max_context: int):
         trace(f"Opening {path}")
-        # ADVANCED TRACE: Inspect file size
         trace(f"File size: {path.stat().st_size / 1024**3:.2f} GB")
         
         kv = nn.state.safe_load(path)
         
-        # Vocab setup logic
         if "tokenizer.ggml.tokens" not in kv:
             trace("Reconstructing vocabulary...")
             vocab_size = 248320
@@ -178,42 +176,34 @@ class Transformer:
             
             clean_k = k
             for p in ["model.language_model.", "language_model.", "model."]:
-                if clean_k.startswith(p):
-                    clean_k = clean_k[len(p):]
+                if clean_k.startswith(p): clean_k = clean_k[len(p):]
             
-            # Key Translation
             if clean_k == 'embed_tokens.weight': clean_k = 'token_embd.weight'
             elif clean_k == 'norm.weight': clean_k = 'output_norm.weight'
             elif clean_k == 'lm_head.weight': clean_k = 'output.weight'
             
-            # DIAGNOSTIC: Force data check on EMBEDDING specifically
+            # STEP 1: Pull raw bytes from DISK to CPU memory using to("CPU").realize()
+            # This bridges the data out of the safetensors file before operations occur.
+            v_cpu = v.to("CPU").realize()
+            
+            # STEP 2: Now that it is in RAM, we can cast dtypes.char (int8) to float.
+            v_proc = v_cpu.cast(dtypes.float32) if v_cpu.dtype == dtypes.char else v_cpu
+            
             if clean_k == 'token_embd.weight':
-                trace(f"DEBUG: Checking {k} -> {v.shape} ({v.dtype})")
+                trace(f"DEBUG: Processing {k} (Original Dtype: {v.dtype})")
                 try:
-                    # Check if buffer even exists
-                    buf = v.lazydata.base.realized if hasattr(v.lazydata, 'base') else None
-                    trace(f"DEBUG: LazyData realized? {buf is not None}")
-                    
-                    # Force read a slice to bypass global realization issues
-                    v_slice = v[0, :10].realize().numpy()
-                    trace(f"DEBUG: First 10 values of {k}: {v_slice}")
-                    
-                    # If slice is zeros, the mapping from safetensors is broken
-                    if v_slice.any():
-                        trace("DEBUG: SUCCESS! Non-zero values detected in slice.")
-                    else:
-                        trace("DEBUG: CRITICAL - Slice is zero. Safetensors read failed.")
+                    # Pull a slice to verify file connectivity
+                    v_slice = v_proc[0, :10].realize().numpy()
+                    trace(f"DEBUG: First 10 values: {v_slice}")
                 except Exception as e:
-                    trace(f"DEBUG: Slice read CRASHED: {e}")
+                    trace(f"DEBUG: Slice read failed: {e}")
 
-            # Force realization to CPU to ensure values are persistent
-            v_real = v.to("CPU").realize()
-            new_sd[clean_k] = v_real
+            # Force realization to finalize the buffer
+            new_sd[clean_k] = v_proc.realize()
 
         trace(f"Loading {len(new_sd)} layers into model structure...")
         nn.state.load_state_dict(model, new_sd, consume=True)
         
-        # Final Verification
         final_emb_mean = model.token_embd.weight.numpy().mean()
         trace(f"FINAL Model Embedding mean: {final_emb_mean:.6f}")
             
