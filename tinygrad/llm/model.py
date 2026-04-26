@@ -3,6 +3,7 @@ import functools, sys, pathlib, re, typing, time
 from datetime import datetime
 from dataclasses import dataclass
 from tinygrad import Tensor, nn, dtypes, Device, Context
+from tinygrad.helpers import tqdm
 
 # Unify GPU targeting for hybrid execution
 GPU_DEVICE = "METAL" if "METAL" in Device._devices else "AMD"
@@ -23,14 +24,13 @@ def apply_rope(x: Tensor, start_pos: int, head_dim: int, theta: float) -> Tensor
 
 @dataclass(frozen=True)
 class SSMConfig:
-    conv_kernel: int; state_size: int; num_qk_heads: int; num_v_heads: int; inner_size: int
+    conv_kernel: int = 4; state_size: int = 48; num_qk_heads: int = 16; num_v_heads: int = 48; inner_size: int = 6144
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
-    norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
-    rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; 
-    ssm: SSMConfig|None = None; qkv_bias: bool = False; offload_layers: int = 32
+    num_blocks: int = 64; dim: int = 5120; hidden_dim: int = 17408; n_heads: int = 24; n_kv_heads: int = 4; 
+    norm_eps: float = 1e-6; vocab_size: int = 248320; head_dim: int = 256; rope_theta: float = 1000000.0; 
+    ssm: SSMConfig = SSMConfig(); offload_layers: int = 32 # Layers to stay on AMD before shifting to METAL/CPU
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -86,11 +86,13 @@ class Transformer:
         with Context(DEV="CPU"): self.token_embd = nn.Embedding(config.vocab_size, config.dim)
         self.layers = []
         for i in range(config.num_blocks):
-            target_dev = "CPU" if i < config.offload_layers else GPU_DEVICE
+            # Hybrid split: assign first N layers to AMD, remaining to METAL/CPU
+            target_dev = "AMD" if i < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
             with Context(DEV=target_dev):
                 layer = {"input_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "post_attention_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "mlp": FFNBlock(config.dim, config.hidden_dim)}
+                # 3:1 architecture implementation: Every 4th layer is Attention
                 if (i + 1) % 4 == 0: layer["self_attn"] = AttentionBlock(config)
                 else: layer["linear_attn"] = SSMBlock(config)
                 self.layers.append(layer)
@@ -100,111 +102,56 @@ class Transformer:
 
     def __call__(self, tokens: Tensor, start_pos: int):
         h = self.token_embd(tokens)
-        h_data = h.numpy()
-        trace(f"Input Embeddings: mean={h_data.mean():.6f}, max={h_data.max():.6f}")
-
         for i, layer in enumerate(self.layers):
             layer_dev = layer["mlp"].up_proj.weight.device
             if h.device != layer_dev:
                 h = h.realize() 
                 with Context(DEV=layer_dev): h = h.to(layer_dev).realize()
             
-            if "self_attn" in layer: h = h + layer["self_attn"](layer["input_layernorm"](h), start_pos)
-            elif "linear_attn" in layer: h = h + layer["linear_attn"](layer["input_layernorm"](h), start_pos)
-            h = h + layer["mlp"](layer["post_attention_layernorm"](h))
+            ln1 = layer["input_layernorm"](h)
+            if "self_attn" in layer: h = h + layer["self_attn"](ln1, start_pos)
+            elif "linear_attn" in layer: h = h + layer["linear_attn"](ln1, start_pos)
             
-            if (i + 1) % 16 == 0:
-                stats = h.numpy()
-                trace(f"Layer {i} stats: mean={stats.mean():.6f}, max={stats.max():.6f}")
-                h = h.realize()
+            h = h + layer["mlp"](layer["post_attention_layernorm"](h))
+            if (i + 1) % 16 == 0: h = h.realize()
 
         if h.device != "CPU": h = h.realize().to("CPU").realize()
-        out_normed = self.output_norm(h)
-        logits = self.output(out_normed).realize()
-        l_np = logits.numpy()
-        trace(f"Logits: mean={l_np.mean():.6f}, max={l_np.max():.6f}, argmax={l_np[0, -1].argmax()}")
-        return logits
-
-    def generate(self, tokens: list[int]):
-        start_pos = 0
-        curr_tokens = Tensor([tokens], device="CPU")
-        while True:
-            logits = self(curr_tokens, start_pos)
-            tok_tensor = logits[0, -1].argmax().realize()
-            next_token = int(tok_tensor.numpy())
-            trace(f"Generated token: {next_token}")
-            yield next_token
-            start_pos += curr_tokens.shape[1]
-            curr_tokens = Tensor([[next_token]], device="CPU")
-            if next_token in [151643, 151645] or start_pos > 2048: break
+        return self.output(self.output_norm(h))
 
     @staticmethod
-    def from_gguf(path: pathlib.Path, max_context: int):
-        trace(f"Opening {path}")
-        trace(f"File size: {path.stat().st_size / 1024**3:.2f} GB")
-        
+    def load_quantized(path: pathlib.Path, config: TransformerConfig):
+        trace(f"Opening unified safetensors: {path}")
         kv = nn.state.safe_load(path)
-        
-        if "tokenizer.ggml.tokens" not in kv:
-            trace("Reconstructing vocabulary...")
-            vocab_size = 248320
-            tokens = [f"t{i}" for i in range(vocab_size)]
-            bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-            cs = bs[:]
-            n = 0
-            for b in range(2**8):
-                if b not in bs: bs.append(b); cs.append(2**8 + n); n += 1
-            byte_decoder = {b: chr(c) for b, c in zip(bs, cs)}
-            for i in range(256): tokens[i] = byte_decoder[i]
-            tokens[151643], tokens[151644], tokens[151645] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
-            kv["tokenizer.ggml.tokens"] = tokens
-            kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
-            for i in [151643, 151644, 151645]: kv["tokenizer.ggml.token_type"][i] = 4
-            kv["tokenizer.ggml.scores"] = [0.0] * vocab_size
-            
-        kv.update({"tokenizer.ggml.pre": "qwen2", "general.architecture": "qwen2"})
-        
-        config = TransformerConfig(64, 5120, 17408, 48, 4, 1e-6, 248320, 256, 1000000.0, 128, 256, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
         model = Transformer(config)
-        
-        trace(f"Mapping model state dict (Found {len(kv)} keys)...")
         new_sd = {}
-        
-        for k, v in kv.items():
-            if not isinstance(v, Tensor): continue
-            if k.startswith("tokenizer."): continue
-            
-            clean_k = k
-            for p in ["model.language_model.", "language_model.", "model."]:
-                if clean_k.startswith(p): clean_k = clean_k[len(p):]
-            
-            if clean_k == 'embed_tokens.weight': clean_k = 'token_embd.weight'
-            elif clean_k == 'norm.weight': clean_k = 'output_norm.weight'
-            elif clean_k == 'lm_head.weight': clean_k = 'output.weight'
-            
-            # STEP 1: Pull raw bytes from DISK to CPU memory using to("CPU").realize()
-            # This bridges the data out of the safetensors file before operations occur.
-            v_cpu = v.to("CPU").realize()
-            
-            # STEP 2: Now that it is in RAM, we can cast dtypes.char (int8) to float.
-            v_proc = v_cpu.cast(dtypes.float32) if v_cpu.dtype == dtypes.char else v_cpu
-            
-            if clean_k == 'token_embd.weight':
-                trace(f"DEBUG: Processing {k} (Original Dtype: {v.dtype})")
-                try:
-                    # Pull a slice to verify file connectivity
-                    v_slice = v_proc[0, :10].realize().numpy()
-                    trace(f"DEBUG: First 10 values: {v_slice}")
-                except Exception as e:
-                    trace(f"DEBUG: Slice read failed: {e}")
 
-            # Force realization to finalize the buffer
-            new_sd[clean_k] = v_proc.realize()
+        trace("Mapping state dict and applying dequantization scales...")
+        # Sort keys to ensure scales are available when weights are processed
+        for k in tqdm(kv.keys()):
+            if k.endswith("_scale"): continue
+            
+            # Bridge to CPU to avoid DISK renderer errors
+            v_raw = kv[k].to("CPU").realize()
+            
+            # DEQUANTIZATION LOGIC: restorative scale multiplication
+            if v_raw.dtype == dtypes.char and f"{k}_scale" in kv:
+                scale = kv[f"{k}_scale"].to("CPU").realize()
+                v_final = (v_raw.cast(dtypes.float32) * scale).realize()
+            else:
+                v_final = v_raw
 
-        trace(f"Loading {len(new_sd)} layers into model structure...")
+            # Device Assignment Logic
+            target_dev = "CPU"
+            if k.startswith("layers."):
+                layer_idx = int(k.split(".")[1])
+                target_dev = "AMD" if layer_idx < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
+            elif any(x in k for x in ["token_embd", "output"]):
+                target_dev = "CPU"
+
+            new_sd[k] = v_final.to(target_dev).realize()
+
+        trace(f"Loading {len(new_sd)} tensors into model structure...")
         nn.state.load_state_dict(model, new_sd, consume=True)
         
-        final_emb_mean = model.token_embd.weight.numpy().mean()
-        trace(f"FINAL Model Embedding mean: {final_emb_mean:.6f}")
-            
-        return model, kv
+        trace(f"FINAL Model Embedding mean: {model.token_embd.weight.numpy().mean():.6f}")
+        return model
