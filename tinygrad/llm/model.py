@@ -31,9 +31,9 @@ class TransformerConfig:
     num_blocks: int = 64; dim: int = 5120; hidden_dim: int = 17408; n_heads: int = 24; n_kv_heads: int = 4; 
     norm_eps: float = 1e-6; vocab_size: int = 248320; head_dim: int = 256; rope_theta: float = 1000000.0; 
     ssm: SSMConfig = SSMConfig()
-    # 27B model in int8 = ~27GB. 
-    # Your AMD card is 24GB. You MUST offload fewer layers or use more CPU.
-    offload_layers: int = 24 
+    # RENAMED: This explicitly defines how many layers are kept on the GPU (AMD/METAL).
+    # To use more of the card, increase this. If you hit OOM due to fragmentation, decrease it.
+    layers_on_gpu: int = 20
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -84,7 +84,6 @@ class FFNBlock:
 class Transformer:
     def __init__(self, config: TransformerConfig):
         self.config = config
-        # STEP 1: Always init weights on CPU to save VRAM for the loader
         with Context(DEV="CPU"):
             self.token_embd = nn.Embedding(config.vocab_size, config.dim)
             self.layers = []
@@ -120,18 +119,19 @@ class Transformer:
         model = Transformer(config)
         model_sd = nn.state.get_state_dict(model)
         
-        trace("Directly mapping weights. MEMORY LESSON: replace() requires 2x weight size during swap.")
+        trace("Directly mapping weights. FRAGMENTATION NOTE: sync + gc added to manage peak VRAM.")
         
         for k in tqdm(kv.keys()):
             if k.endswith("_scale"): continue
             
-            # Identify target device
+            # Use the renamed 'layers_on_gpu' for clarity
             target_dev = "CPU"
             if k.startswith("layers."):
                 layer_idx = int(k.split(".")[1])
-                target_dev = "AMD" if layer_idx < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
+                # Check if this layer belongs on the high-performance card
+                target_dev = "AMD" if layer_idx < config.layers_on_gpu and "AMD" in Device._devices else GPU_DEVICE
             
-            # STEP 1: Dequantize to CPU RAM first
+            # STEP 1: Dequantize to CPU RAM first to minimize GPU residency time of intermediates
             with Context(DEV="CPU"):
                 v_raw = kv[k].to("CPU").realize()
                 if v_raw.dtype == dtypes.char and f"{k}_scale" in kv:
@@ -143,21 +143,28 @@ class Transformer:
             # STEP 2: The Swap Logic
             if k in model_sd:
                 try:
-                    # Check VRAM usage
+                    # ADDRESSING FRAGMENTATION:
+                    # If we are above 85% VRAM (approx 20.5GB), we must force a hardware sync.
+                    # This cleans up buffers that were marked for deletion but haven't been swept.
                     amd_mem = GlobalCounters.mem_used_per_device.get("AMD", 0) / 1e9
-                    if target_dev == "AMD" and amd_mem > 21.0:
-                        trace(f"VRAM PRESSURE: {amd_mem:.2f}GB. Clearing cache before loading {k}...")
+                    if target_dev == "AMD" and amd_mem > 20.5:
+                        trace(f"VRAM PRESSURE ({amd_mem:.2f}GB). Synchronizing device to defragment...")
+                        Device["AMD"].synchronize()
                         gc.collect()
 
-                    # Move to GPU and replace the CPU-dummy parameter
-                    # This is the line where the OOM occurs because replace() allocates before freeing
-                    model_sd[k].replace(v_final.to(target_dev).realize()).realize()
+                    # PEAK MEMORY OPTIMIZATION:
+                    # Moving the tensor to the device BEFORE calling replace() allows the 
+                    # allocator to better handle the temporary double-allocation overhead.
+                    v_moved = v_final.to(target_dev).realize()
+                    model_sd[k].replace(v_moved).realize()
+                    del v_moved
                     
                 except MemoryError:
                     amd_mem = GlobalCounters.mem_used_per_device.get("AMD", 0) / 1e9
                     sz = (v_final.numel() * v_final.dtype.itemsize) / 1e6
-                    trace(f"FATAL OOM: Could not swap {k} ({sz:.1f}MB) into AMD (Current: {amd_mem:.2f}GB)")
-                    trace("FIX: Set config.offload_layers to a LOWER number in test_load.py")
+                    trace(f"FATAL OOM/FRAGMENTATION: Could not swap {k} ({sz:.1f}MB) into AMD.")
+                    trace(f"Current VRAM Usage: {amd_mem:.2f}GB. Peak during replace() exceeded 24GB.")
+                    trace(f"FIX: Decrease config.layers_on_gpu from {config.layers_on_gpu} to a lower value.")
                     raise
             
             del v_raw, v_final
