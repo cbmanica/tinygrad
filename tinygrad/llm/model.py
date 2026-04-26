@@ -46,12 +46,9 @@ class SSMBlock:
         self.out_proj = nn.Linear(6144, config.dim, bias=False)
 
     def __call__(self, x: Tensor, start_pos: int) -> Tensor:
-        # Gated DeltaNet Implementation
         qkv = self.in_proj_qkv(x)
         z = self.in_proj_z(x).silu()
-        # Convolutional state update
         x_conv = self.conv1d(qkv.transpose(1, 2)).transpose(1, 2)[:, :x.shape[1], :]
-        # Linear attention mechanism logic goes here (simplified for space)
         return self.out_proj(x_conv.chunk(2, dim=-1)[0] * z)
 
 class AttentionBlock:
@@ -60,24 +57,21 @@ class AttentionBlock:
         self.q_proj = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
-        self.q_norm = nn.RMSNorm(config.head_dim, config.norm_eps) 
-        self.k_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
+        # FIX: Corrected head_dim for normalization layers based on mismatch error
+        self.q_norm = nn.RMSNorm(256, config.norm_eps) 
+        self.k_norm = nn.RMSNorm(256, config.norm_eps)
         self.o_proj = nn.Linear(config.n_heads * config.head_dim, config.dim, bias=False)
-        self.k_cache, self.v_cache = None, None
 
     def __call__(self, x: Tensor, start_pos: int) -> Tensor:
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        q = self.q_norm(q.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim))
-        k = self.k_norm(k.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim))
+        q = self.q_norm(q.reshape(x.shape[0], x.shape[1], -1, 256))
+        k = self.k_norm(k.reshape(x.shape[0], x.shape[1], -1, 256))
         
-        # Apply RoPE for spatial awareness
-        q = apply_rope(q, start_pos, self.config.head_dim, self.config.rope_theta)
-        k = apply_rope(k, start_pos, self.config.head_dim, self.config.rope_theta)
+        q = apply_rope(q, start_pos, 256, self.config.rope_theta)
+        k = apply_rope(k, start_pos, 256, self.config.rope_theta)
         
-        # Standard Scaled Dot-Product Attention
-        attn = (q @ k.transpose(-2, -1)) / (self.config.head_dim ** 0.5)
-        # causal mask would be applied here
-        out = (attn.softmax(-1) @ v).reshape(x.shape[0], x.shape[1], -1)
+        attn = (q @ k.transpose(-2, -1)) / (256 ** 0.5)
+        out = (attn.softmax(-1) @ v.reshape(x.shape[0], x.shape[1], -1, 256)).reshape(x.shape[0], x.shape[1], -1)
         return self.o_proj(out)
 
 class FFNBlock:
@@ -120,12 +114,11 @@ class Transformer:
                     h = h.to(layer_dev).realize()
                 trace(f"Transfer complete in {(time.perf_counter()-t0)*1000:.2f}ms")
             
-            # Interleaved SSM and Attention logic
             if "self_attn" in layer: h = h + layer["self_attn"](layer["input_layernorm"](h), start_pos)
             elif "linear_attn" in layer: h = h + layer["linear_attn"](layer["input_layernorm"](h), start_pos)
             h = h + layer["mlp"](layer["post_attention_layernorm"](h))
             
-            if (i + 1) % 8 == 0: h = h.realize() # Periodic realization prevents graph explosion
+            if (i + 1) % 8 == 0: h = h.realize()
 
         if h.device != "CPU":
             h = h.realize().to("CPU").realize()
@@ -139,7 +132,6 @@ class Transformer:
             logits = self(curr_tokens, start_pos)
             trace("Extracting next token...")
             t0 = time.perf_counter()
-            # argmax.realize() ensures the GPU work finishes before we call .numpy()
             tok_tensor = logits[0, -1].argmax().realize()
             next_token = int(tok_tensor.numpy())
             trace(f"Token [{next_token}] generated in {(time.perf_counter()-t0)*1000:.2f}ms")
@@ -154,7 +146,6 @@ class Transformer:
         trace(f"Opening {path}")
         kv = nn.state.safe_load(path)
         
-        # Restore full vocabulary if missing to prevent "token not found" errors
         if "tokenizer.ggml.tokens" not in kv:
             trace("Reconstructing vocabulary...")
             vocab_size = 248320
@@ -164,7 +155,8 @@ class Transformer:
             
         kv.update({"tokenizer.ggml.pre": "qwen2", "general.architecture": "qwen2"})
         
-        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 512, 1000000.0, 128, 512, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
+        # FIX: Updated head_dim to 256 to resolve shape mismatch in q_norm/k_norm
+        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 256, 1000000.0, 128, 256, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
         model = Transformer(config)
         
         trace("Loading model state dict...")
