@@ -27,6 +27,20 @@ class SSMConfig:
 
 @dataclass(frozen=True)
 class TransformerConfig:
+    """
+    ARCHITECTURAL LESSONS FOR QWEN 3.6-27B:
+    1. head_dim: 256. (512 causes RMSNorm mismatches).
+    2. n_heads: 48 for Q (12288 dim).
+    3. n_kv_heads: 4 (1024 dim).
+    4. o_proj: Expects (5120, 6144), implying a 24-head output bottleneck.
+    5. dim: 5120.
+    
+    TOKENIZER LESSONS:
+    - Reconstructing vocab from .safetensors requires BOTH special tokens AND byte-mappings.
+    - SimpleTokenizer DOES NOT take raw bytes (e.g. b'\x00'). It expects strings of 
+      mapped unicode characters (bytes_to_unicode). 
+    - Providing raw bytes causes "KeyError: 0" in SimpleTokenizer.__init__.
+    """
     num_blocks: int; dim: int; hidden_dim: int; n_heads: int; n_kv_heads: int; 
     norm_eps: float; vocab_size: int; head_dim: int; rope_theta: float; 
     rope_dim: int; v_head_dim: int; max_context: int = 0; qk_norm: bool = False; 
@@ -57,21 +71,18 @@ class AttentionBlock:
         self.q_proj = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.dim, config.n_kv_heads * config.head_dim, bias=False)
-        # FIX: Corrected head_dim for normalization layers based on mismatch error
-        self.q_norm = nn.RMSNorm(256, config.norm_eps) 
-        self.k_norm = nn.RMSNorm(256, config.norm_eps)
-        self.o_proj = nn.Linear(config.n_heads * config.head_dim, config.dim, bias=False)
+        self.q_norm = nn.RMSNorm(config.head_dim, config.norm_eps) 
+        self.k_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
+        self.o_proj = nn.Linear(6144, config.dim, bias=False)
 
     def __call__(self, x: Tensor, start_pos: int) -> Tensor:
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        q = self.q_norm(q.reshape(x.shape[0], x.shape[1], -1, 256))
-        k = self.k_norm(k.reshape(x.shape[0], x.shape[1], -1, 256))
-        
-        q = apply_rope(q, start_pos, 256, self.config.rope_theta)
-        k = apply_rope(k, start_pos, 256, self.config.rope_theta)
-        
-        attn = (q @ k.transpose(-2, -1)) / (256 ** 0.5)
-        out = (attn.softmax(-1) @ v.reshape(x.shape[0], x.shape[1], -1, 256)).reshape(x.shape[0], x.shape[1], -1)
+        q = self.q_norm(q.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim))
+        k = self.k_norm(k.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim))
+        q = apply_rope(q, start_pos, self.config.head_dim, self.config.rope_theta)
+        k = apply_rope(k, start_pos, self.config.head_dim, self.config.rope_theta)
+        attn = (q @ k.transpose(-2, -1)) / (self.config.head_dim ** 0.5)
+        out = (attn.softmax(-1) @ v.reshape(x.shape[0], x.shape[1], -1, self.config.head_dim)).reshape(x.shape[0], x.shape[1], -1)
         return self.o_proj(out)
 
 class FFNBlock:
@@ -102,27 +113,16 @@ class Transformer:
 
     def __call__(self, tokens: Tensor, start_pos: int):
         h = self.token_embd(tokens)
-        trace(f"Forward Pass L0: {h.shape} on {h.device}")
-        
         for i, layer in enumerate(self.layers):
             layer_dev = layer["mlp"].up_proj.weight.device
             if h.device != layer_dev:
-                t0 = time.perf_counter()
                 h = h.realize() 
-                trace(f"Crossing {h.device}->{layer_dev} at Layer {i}")
-                with Context(DEV=layer_dev):
-                    h = h.to(layer_dev).realize()
-                trace(f"Transfer complete in {(time.perf_counter()-t0)*1000:.2f}ms")
-            
+                with Context(DEV=layer_dev): h = h.to(layer_dev).realize()
             if "self_attn" in layer: h = h + layer["self_attn"](layer["input_layernorm"](h), start_pos)
             elif "linear_attn" in layer: h = h + layer["linear_attn"](layer["input_layernorm"](h), start_pos)
             h = h + layer["mlp"](layer["post_attention_layernorm"](h))
-            
             if (i + 1) % 8 == 0: h = h.realize()
-
-        if h.device != "CPU":
-            h = h.realize().to("CPU").realize()
-            
+        if h.device != "CPU": h = h.realize().to("CPU").realize()
         return self.output(self.output_norm(h)).realize()
 
     def generate(self, tokens: list[int]):
@@ -130,12 +130,8 @@ class Transformer:
         curr_tokens = Tensor([tokens], device="CPU")
         while True:
             logits = self(curr_tokens, start_pos)
-            trace("Extracting next token...")
-            t0 = time.perf_counter()
             tok_tensor = logits[0, -1].argmax().realize()
             next_token = int(tok_tensor.numpy())
-            trace(f"Token [{next_token}] generated in {(time.perf_counter()-t0)*1000:.2f}ms")
-            
             yield next_token
             start_pos += curr_tokens.shape[1]
             curr_tokens = Tensor([[next_token]], device="CPU")
@@ -147,16 +143,35 @@ class Transformer:
         kv = nn.state.safe_load(path)
         
         if "tokenizer.ggml.tokens" not in kv:
-            trace("Reconstructing vocabulary...")
+            trace("Reconstructing vocabulary with unicode-byte mapping...")
             vocab_size = 248320
-            kv["tokenizer.ggml.tokens"] = [f"t{i}" for i in range(vocab_size)]
+            tokens = [f"t{i}" for i in range(vocab_size)]
+            
+            # SimpleTokenizer expects bytes mapped to specific unicode characters
+            # This is the standard GPT-2 byte encoder used in Qwen2/tinygrad
+            bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+            cs = bs[:]
+            n = 0
+            for b in range(2**8):
+                if b not in bs:
+                    bs.append(b)
+                    cs.append(2**8 + n)
+                    n += 1
+            byte_decoder = {b: chr(c) for b, c in zip(bs, cs)}
+            
+            for i in range(256): tokens[i] = byte_decoder[i]
+            
+            # Special tokens MUST be plain strings
+            tokens[151643], tokens[151644], tokens[151645] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+            
+            kv["tokenizer.ggml.tokens"] = tokens
             kv["tokenizer.ggml.token_type"] = [1] * vocab_size 
+            for i in [151643, 151644, 151645]: kv["tokenizer.ggml.token_type"][i] = 4
             kv["tokenizer.ggml.scores"] = [0.0] * vocab_size
             
         kv.update({"tokenizer.ggml.pre": "qwen2", "general.architecture": "qwen2"})
         
-        # FIX: Updated head_dim to 256 to resolve shape mismatch in q_norm/k_norm
-        config = TransformerConfig(64, 5120, 17408, 24, 2, 1e-6, 248320, 256, 1000000.0, 128, 256, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
+        config = TransformerConfig(64, 5120, 17408, 48, 4, 1e-6, 248320, 256, 1000000.0, 128, 256, max_context, True, SSMConfig(4, 48, 24, 2, 6144), False, 32)
         model = Transformer(config)
         
         trace("Loading model state dict...")
