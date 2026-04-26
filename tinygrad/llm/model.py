@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from tinygrad import Tensor, nn, dtypes, Device, Context
 from tinygrad.helpers import tqdm
 
-# Unify GPU targeting for hybrid execution
 GPU_DEVICE = "METAL" if "METAL" in Device._devices else "AMD"
 
 def trace(msg):
@@ -30,7 +29,7 @@ class SSMConfig:
 class TransformerConfig:
     num_blocks: int = 64; dim: int = 5120; hidden_dim: int = 17408; n_heads: int = 24; n_kv_heads: int = 4; 
     norm_eps: float = 1e-6; vocab_size: int = 248320; head_dim: int = 256; rope_theta: float = 1000000.0; 
-    ssm: SSMConfig = SSMConfig(); offload_layers: int = 32 # Layers to stay on AMD before shifting to METAL/CPU
+    ssm: SSMConfig = SSMConfig(); offload_layers: int = 32 
 
 class SSMBlock:
     def __init__(self, config: TransformerConfig):
@@ -40,9 +39,7 @@ class SSMBlock:
         self.in_proj_a = nn.Linear(config.dim, ssm.state_size, bias=False)
         self.in_proj_b = nn.Linear(config.dim, ssm.state_size, bias=False)
         self.conv1d = nn.Conv1d(10240, 10240, ssm.conv_kernel, groups=10240, padding=ssm.conv_kernel-1, bias=False)
-        self.A_log = Tensor.empty(ssm.state_size)
-        self.dt_bias = Tensor.empty(ssm.state_size)
-        self.norm = nn.RMSNorm(128, config.norm_eps) 
+        self.A_log = Tensor.empty(ssm.state_size); self.dt_bias = Tensor.empty(ssm.state_size)
         self.out_proj = nn.Linear(6144, config.dim, bias=False)
 
     def __call__(self, x: Tensor, start_pos: int) -> Tensor:
@@ -86,13 +83,11 @@ class Transformer:
         with Context(DEV="CPU"): self.token_embd = nn.Embedding(config.vocab_size, config.dim)
         self.layers = []
         for i in range(config.num_blocks):
-            # Hybrid split: assign first N layers to AMD, remaining to METAL/CPU
             target_dev = "AMD" if i < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
             with Context(DEV=target_dev):
                 layer = {"input_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "post_attention_layernorm": nn.RMSNorm(config.dim, config.norm_eps),
                          "mlp": FFNBlock(config.dim, config.hidden_dim)}
-                # 3:1 architecture implementation: Every 4th layer is Attention
                 if (i + 1) % 4 == 0: layer["self_attn"] = AttentionBlock(config)
                 else: layer["linear_attn"] = SSMBlock(config)
                 self.layers.append(layer)
@@ -107,51 +102,31 @@ class Transformer:
             if h.device != layer_dev:
                 h = h.realize() 
                 with Context(DEV=layer_dev): h = h.to(layer_dev).realize()
-            
             ln1 = layer["input_layernorm"](h)
             if "self_attn" in layer: h = h + layer["self_attn"](ln1, start_pos)
             elif "linear_attn" in layer: h = h + layer["linear_attn"](ln1, start_pos)
-            
             h = h + layer["mlp"](layer["post_attention_layernorm"](h))
             if (i + 1) % 16 == 0: h = h.realize()
-
         if h.device != "CPU": h = h.realize().to("CPU").realize()
         return self.output(self.output_norm(h))
 
     @staticmethod
     def load_quantized(path: pathlib.Path, config: TransformerConfig):
-        trace(f"Opening unified safetensors: {path}")
+        trace(f"Loading unified safetensors: {path}")
         kv = nn.state.safe_load(path)
         model = Transformer(config)
         new_sd = {}
-
-        trace("Mapping state dict and applying dequantization scales...")
-        # Sort keys to ensure scales are available when weights are processed
         for k in tqdm(kv.keys()):
             if k.endswith("_scale"): continue
-            
-            # Bridge to CPU to avoid DISK renderer errors
             v_raw = kv[k].to("CPU").realize()
-            
-            # DEQUANTIZATION LOGIC: restorative scale multiplication
             if v_raw.dtype == dtypes.char and f"{k}_scale" in kv:
                 scale = kv[f"{k}_scale"].to("CPU").realize()
                 v_final = (v_raw.cast(dtypes.float32) * scale).realize()
-            else:
-                v_final = v_raw
-
-            # Device Assignment Logic
+            else: v_final = v_raw
             target_dev = "CPU"
             if k.startswith("layers."):
                 layer_idx = int(k.split(".")[1])
                 target_dev = "AMD" if layer_idx < config.offload_layers and "AMD" in Device._devices else GPU_DEVICE
-            elif any(x in k for x in ["token_embd", "output"]):
-                target_dev = "CPU"
-
             new_sd[k] = v_final.to(target_dev).realize()
-
-        trace(f"Loading {len(new_sd)} tensors into model structure...")
         nn.state.load_state_dict(model, new_sd, consume=True)
-        
-        trace(f"FINAL Model Embedding mean: {model.token_embd.weight.numpy().mean():.6f}")
         return model
