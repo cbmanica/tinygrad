@@ -8,7 +8,7 @@ from tinygrad import Tensor, nn, dtypes, Device, Context
 GPU_DEVICE = "METAL" if "METAL" in Device._devices else "AMD"
 
 def trace(msg):
-    # Added millisecond precision timestamps
+    # Restored high-precision timestamps for debugging loop hangs
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] --- [TRACE] {msg} ---")
     sys.stdout.flush()
@@ -89,7 +89,7 @@ class Transformer:
             layer_dev = layer["mlp"].up_proj.weight.device
             if h.device != layer_dev:
                 t0 = time.perf_counter()
-                h = h.realize() # Finalize CPU graph
+                h = h.realize() 
                 trace(f"Crossing {h.device}->{layer_dev} at L{i}")
                 with Context(DEV=layer_dev):
                     h = h.to(layer_dev).realize()
@@ -99,10 +99,9 @@ class Transformer:
             elif "linear_attn" in layer: h = h + layer["linear_attn"](layer["input_layernorm"](h), start_pos)
             h = (h + layer["mlp"](layer["post_attention_layernorm"](h)))
             
-            if (i + 1) % 8 == 0: h = h.realize() # Periodic realization to clear scheduler
+            if (i + 1) % 8 == 0: h = h.realize() # Clears lazy graph to prevent hangs
 
         if h.device != "CPU":
-            trace("Final realization and copy to CPU")
             h = h.realize().to("CPU").realize()
             
         return self.output(self.output_norm(h)).realize()
@@ -114,7 +113,7 @@ class Transformer:
             logits = self(curr_tokens, start_pos)
             trace("Calculating argmax...")
             t0 = time.perf_counter()
-            # Explicitly realize the index calculation before calling .numpy()
+            # Explicitly realize index before numpy() to prevent async hangs
             tok_tensor = logits[0, -1].argmax().realize()
             next_token = int(tok_tensor.numpy())
             trace(f"Next token [{next_token}] identified in {(time.perf_counter()-t0)*1000:.2f}ms")
@@ -128,7 +127,10 @@ class Transformer:
     def from_gguf(path: pathlib.Path, max_context: int):
         trace(f"Opening {path}")
         kv = nn.state.safe_load(path)
-        # Tokenizer sanitization (standard Qwen template)
+        
+        # RESTORED: Proper metadata for SimpleTokenizer
+        if "tokenizer.ggml.pre" not in kv:
+            kv["tokenizer.ggml.pre"] = "qwen2"
         if "tokenizer.ggml.tokens" not in kv:
             vocab_size = 248320
             kv.update({"tokenizer.ggml.tokens": [f"t{i}" for i in range(vocab_size)], 
@@ -138,10 +140,12 @@ class Transformer:
         model = Transformer(config)
         
         trace("Mapping and Loading weights...")
-        new_sd = {re.sub(r'^(model\.)?(language_model\.)?', '', k): v for k, v in kv.items()}
+        # Sanitize keys for the model but keep 'kv' intact for the tokenizer
+        new_sd = {re.sub(r'^(model\.)?(language_model\.)?', '', k): v for k, v in kv.items() if not k.startswith("tokenizer.")}
         mapping = {'embed_tokens.weight': 'token_embd.weight', 'lm_head.weight': 'output.weight', 'norm.weight': 'output_norm.weight'}
         for old, new in mapping.items():
             if old in new_sd: new_sd[new] = new_sd.pop(old)
+        
         nn.state.load_state_dict(model, new_sd, consume=True)
 
         # Warm-up: Ensure the Metal/AMD drivers are initialized
