@@ -183,21 +183,33 @@ class LLMServer(TCPServerWithReuse):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
+  parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF/safetensors file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--amd-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on AMD GPU")
+  parser.add_argument("--metal-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on Metal")
+  parser.add_argument("--cpu-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on CPU")
+  parser.add_argument("--amd-budget-gb", type=float, default=0.0, metavar="GB", help="AMD VRAM budget for auto placement (0=all-METAL, default 0)")
   args = parser.parse_args()
 
   # load the model
-  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
-  model_name = kv.get('general.name') or kv.get('general.basename') or args.model
+  model_path = pathlib.Path(models.get(args.model, args.model)).expanduser()
+  if model_path.suffix == ".safetensors" and model_path.exists():
+    from tinygrad.llm.safetensors_loader import from_safetensors
+    from tinygrad.llm.hf_tokenizer import from_hf_tokenizer_json
+    model = from_safetensors(model_path, max_context=args.max_context,
+                             amd_layers=args.amd_layers, metal_layers=args.metal_layers,
+                             cpu_layers=args.cpu_layers, amd_budget_gb=args.amd_budget_gb)
+    tok = from_hf_tokenizer_json(model_path.parent)
+    model_name = model_path.stem
+  else:
+    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+    model_name = kv.get('general.name') or kv.get('general.basename') or args.model
+    tok = SimpleTokenizer.from_gguf_kv(kv)
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
-
-  # get tokenizer
-  tok = SimpleTokenizer.from_gguf_kv(kv)
 
   # warmup the JIT
   if args.warmup or args.serve:
