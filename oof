@@ -1,0 +1,8 @@
+Benchmark summary (Qwen3.6-27B int8, 20 tokens, steady state after JIT warmup):
+
+Mode	Throughput	Bandwidth	Config
+AMD+Metal	~4.5–4.9 tok/s	~120–137 GB/s	52 AMD + 12 Metal layers
+Metal-only	~5.06–5.12 tok/s	~141–144 GB/s	64 Metal layers
+Metal-only is ~10% faster in decode throughput. The AMD layers add cross-device transfer overhead over the USB4/Thunderbolt link that outweighs the GPU compute benefit for single-token decode. Both runs use ~28 GB total, just split differently between the two VRAM pools.
+
+The multi-device implementation is working correctly (52 AMD + 12 Metal, no errors, stable output) — the USB4 latency just dominates at this token rate. AMD+Metal would likely show a bigger advantage for prefill (long input sequences where compute scales but memory bandwidth doesn't).
