@@ -61,6 +61,26 @@ def _resolve_placement(config: TransformerConfig, amd_layers, metal_layers, cpu_
   return placement
 
 
+def _comgr_prewarm(arch: str = "gfx1100") -> None:
+  """Compile a trivial AMD kernel to initialize COMGR before Metal compiles anything.
+
+  Metal's shader compiler and COMGR share LLVM library state on macOS ARM. If Metal
+  compiles first, COMGR's subsequent amd_comgr_do_action calls crash with SIGBUS.
+  Calling this before the first model.forward() (i.e., before the JIT trace) ensures
+  COMGR is initialized while the LLVM state is still clean.
+  """
+  try:
+    from tinygrad.runtime.support.compiler_amd import compile_hip
+    _DUMMY = (
+      "typedef long unsigned int size_t;\n"
+      "extern \"C\" __attribute__((device, const)) size_t __ockl_get_local_id(unsigned int);\n"
+      "extern \"C\" __attribute__((global)) void _tg_prewarm(float* x) { x[0] = 0.0f; }\n"
+    )
+    compile_hip(_DUMMY, arch)
+  except Exception:
+    pass  # best-effort: if prewarm fails, compilation will crash later with a clear error
+
+
 def _patch_for_multidevice(model: Transformer, placement: list[str]) -> None:
   """Patch model.forward and full-attn _init_state for multi-device inference.
 
@@ -70,8 +90,14 @@ def _patch_for_multidevice(model: Transformer, placement: list[str]) -> None:
   2. Patches TransformerBlock._init_state so freqs_cis (normally created on
      the default METAL device by precompute_freqs_cis) is moved to the block's
      device before it's captured as an implicit buffer.
+  3. Overrides __call__ on AMD blocks to use precompile=False — AMD COMGR
+     crashes on giant precompiled blocks for 27B models, so defer compilation
+     to the outer TinyJit (which compiles per-kernel).
+  4. Pre-warms COMGR before the JIT traces the forward pass — avoids a SIGBUS
+     caused by Metal's LLVM initialization racing with COMGR on macOS ARM.
   """
   import types
+  from tinygrad import function
   from tinygrad.llm.model import TransformerBlock
 
   # Patch full-attn blocks so freqs_cis ends up on the block's device
@@ -95,6 +121,19 @@ def _patch_for_multidevice(model: Transformer, placement: list[str]) -> None:
 
     block._init_state = types.MethodType(_make_patched_init(target_dev, orig_init), block)
 
+  # AMD-specific block call that bypasses precompile (avoids COMGR crash on huge kernels).
+  # Note: can't patch block.__call__ on the instance — Python looks up __call__ on the class.
+  # So dispatch through the patched forward instead.
+  def _amd_block_call(block, x: Tensor, start_pos):
+    block._init_state(x)
+    @function(precompile=False, allow_implicit=True)
+    def _run(x: Tensor, start_pos):
+      h = x + block._attention(block.attn_norm(x), start_pos)
+      return (h + block._feed_forward(block.ffn_norm(h))).contiguous()
+    return _run(x, start_pos)
+
+  amd_indices = {i for i, p in enumerate(placement) if p == "AMD"}
+
   # Get the device of the output projection (non-block tensors land on METAL)
   output_device: str = model.output_norm.weight.device  # type: ignore[assignment]
 
@@ -104,7 +143,7 @@ def _patch_for_multidevice(model: Transformer, placement: list[str]) -> None:
       target = placement[i]
       if x.device != target:
         x = x.to(target)
-      x = block(x, start_pos)
+      x = _amd_block_call(block, x, start_pos) if i in amd_indices else block(x, start_pos)
     if x.device != output_device:
       x = x.to(output_device)
     logits = model.output(model.output_norm(x))[:, -1, :]
@@ -143,6 +182,11 @@ def from_safetensors(path, max_context: int = 4096, amd_layers=None, metal_layer
     )
 
   placement = _resolve_placement(config, amd_layers, metal_layers, cpu_layers, amd_budget_gb, block_sizes)
+
+  # Pre-warm COMGR before any Metal GPU work — Metal's LLVM initialization
+  # races with COMGR on macOS ARM and causes a SIGBUS if COMGR runs second.
+  if "AMD" in placement:
+    _comgr_prewarm()
 
   raw = nn.state.safe_load(str(path))
   state = nn.state.get_state_dict(model)

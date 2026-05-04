@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 300 python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(python3 -c \"from tinygrad.llm.safetensors_loader import _patch_for_multidevice; print\\('import ok'\\)\")",
+      "Bash(/opt/homebrew/bin/python3.14 -c \"import tqdm; print\\('ok'\\)\")",
+      "Bash(/opt/homebrew/bin/python3 -m pip list)",
+      "Bash(/Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(set +o pipefail)",
+      "Read(//tmp/**)",
+      "Bash(/Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 0.5)",
+      "Read(//private/tmp/**)",
+      "Bash(/Users/bridget/dev/tinygrad/venv/bin/python -c ' *)",
+      "Bash(hipcc --version)",
+      "Bash(otool -l /opt/homebrew/lib/libamd_comgr.dylib)",
+      "Bash(brew list *)",
+      "Bash(otool -D /opt/homebrew/lib/libamd_comgr.dylib)",
+      "Bash(CACHEDB=/tmp/smoke_fresh.db /Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(CACHEDB=/tmp/smoke_fresh2.db /Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)"
+    ]
+  }
+}
