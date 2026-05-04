@@ -3,16 +3,16 @@
 Usage:
   python extra/quantize_qwen_smoke.py path/to/model.safetensors [--amd-budget-gb N]
 
-Default placement is all-METAL (amd_budget_gb=0). Pass --amd-budget-gb 20 to
-enable AMD auto-placement (note: AMD HIP compilation may crash for large models).
+Default is --amd-budget-gb 20 (auto-placement with up to 20 GB on AMD).
+Pass --amd-budget-gb 0 to force all-METAL.
 """
 import sys, pathlib, argparse
 
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("path", type=str, help="Path to unified .safetensors file")
-  parser.add_argument("--amd-budget-gb", type=float, default=0.0,
-                      help="AMD VRAM budget in GB (0=all-METAL, default 0)")
+  parser.add_argument("--amd-budget-gb", type=float, default=20.0,
+                      help="AMD VRAM budget in GB (0=all-METAL, default 20)")
   args = parser.parse_args()
 
   path = pathlib.Path(args.path).expanduser()

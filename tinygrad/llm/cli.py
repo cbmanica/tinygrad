@@ -191,7 +191,7 @@ def main():
   parser.add_argument("--amd-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on AMD GPU")
   parser.add_argument("--metal-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on Metal")
   parser.add_argument("--cpu-layers", type=int, nargs="+", metavar="I", help="Layer indices to place on CPU")
-  parser.add_argument("--amd-budget-gb", type=float, default=0.0, metavar="GB", help="AMD VRAM budget for auto placement (0=all-METAL, default 0)")
+  parser.add_argument("--amd-budget-gb", type=float, default=20.0, metavar="GB", help="AMD VRAM budget for auto placement (0=all-METAL, default 20)")
   args = parser.parse_args()
 
   # load the model

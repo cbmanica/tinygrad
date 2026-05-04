@@ -158,6 +158,12 @@ def _patch_for_multidevice(model: Transformer, placement: list[str]) -> None:
 
 def from_safetensors(path, max_context: int = 4096, amd_layers=None, metal_layers=None,
                      cpu_layers=None, amd_budget_gb: float = 20.0) -> Transformer:
+  # Pre-warm COMGR BEFORE any model/device initialization.
+  # The COMGR dylib must be loaded before Transformer() creates Metal tensors;
+  # loading it later races with Metal's LLVM state and causes SIGBUS on macOS ARM.
+  if amd_layers or amd_budget_gb > 0.0:
+    _comgr_prewarm()
+
   path = pathlib.Path(path)
   header, meta = _read_header(path)
 
@@ -182,11 +188,6 @@ def from_safetensors(path, max_context: int = 4096, amd_layers=None, metal_layer
     )
 
   placement = _resolve_placement(config, amd_layers, metal_layers, cpu_layers, amd_budget_gb, block_sizes)
-
-  # Pre-warm COMGR before any Metal GPU work — Metal's LLVM initialization
-  # races with COMGR on macOS ARM and causes a SIGBUS if COMGR runs second.
-  if "AMD" in placement:
-    _comgr_prewarm()
 
   raw = nn.state.safe_load(str(path))
   state = nn.state.get_state_dict(model)

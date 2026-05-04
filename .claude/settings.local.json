@@ -18,7 +18,10 @@
       "Bash(brew list *)",
       "Bash(otool -D /opt/homebrew/lib/libamd_comgr.dylib)",
       "Bash(CACHEDB=/tmp/smoke_fresh.db /Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
-      "Bash(CACHEDB=/tmp/smoke_fresh2.db /Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)"
+      "Bash(CACHEDB=/tmp/smoke_fresh2.db /Users/bridget/dev/tinygrad/venv/bin/python extra/quantize_qwen_smoke.py ~/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(CACHEDB=/tmp/smoke_direct3.db /Users/bridget/dev/tinygrad/venv/bin/python -u -X faulthandler extra/quantize_qwen_smoke.py /Users/bridget/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(CACHEDB=/tmp/smoke_fix1.db /Users/bridget/dev/tinygrad/venv/bin/python -u -X faulthandler extra/quantize_qwen_smoke.py /Users/bridget/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors --amd-budget-gb 20)",
+      "Bash(CACHEDB=/tmp/smoke_final_clean.db /Users/bridget/dev/tinygrad/venv/bin/python -u extra/quantize_qwen_smoke.py /Users/bridget/hug-models/Qwen3.6-27B/qwen3.6-27b-int8-unified.safetensors)"
     ]
   }
 }
