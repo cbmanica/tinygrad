@@ -141,12 +141,80 @@ class Handler(HTTPRequestHandler):
     stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                f"out:{len(out):5d}  {colored('--', 'BLACK')}  total:{et-st:6.2f}s\n")
 
+  @staticmethod
+  def _content_to_text(content) -> str:
+    if isinstance(content, str): return content
+    parts = []
+    for block in content:
+      t = block.get("type", "")
+      if t == "text": parts.append(block["text"])
+      elif t == "tool_use":
+        parts.append(f'<tool_use name="{block["name"]}">\n{json.dumps(block.get("input", {}))}\n</tool_use>')
+      elif t == "tool_result":
+        inner = block.get("content", "")
+        if isinstance(inner, list): inner = "\n".join(b.get("text","") for b in inner if b.get("type")=="text")
+        parts.append(f'<tool_result tool_use_id="{block.get("tool_use_id","")}">\n{inner}\n</tool_result>')
+      # thinking / redacted_thinking / image — skip
+    return "\n".join(parts)
+
+  def _stream_anthropic(self, ids:list[int], msg_id:str, model_name:str, max_tokens:int|None, temperature:float):
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      def send_event(name:str, data:dict):
+        self.wfile.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()); self.wfile.flush()
+      send_event("message_start", {"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant",
+        "content":[],"model":model_name,"stop_reason":None,"stop_sequence":None,
+        "usage":{"input_tokens":len(ids),"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}})
+      send_event("content_block_start", {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
+      send_event("ping", {"type":"ping"})
+      model, tok = self.server.model, self.server.tok
+      dec, out_count, stop_reason = tok.stream_decoder(), 0, "end_turn"
+      for next_id in model.generate(ids, temperature=temperature):
+        if tok.is_end(next_id): break
+        out_count += 1
+        send_event("content_block_delta", {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":dec(next_id)}})
+        if max_tokens is not None and out_count >= max_tokens: stop_reason = "max_tokens"; break
+      if (tail := dec()): send_event("content_block_delta", {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":tail}})
+      send_event("content_block_stop", {"type":"content_block_stop","index":0})
+      send_event("message_delta", {"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":None},"usage":{"output_tokens":out_count}})
+      send_event("message_stop", {"type":"message_stop"})
+    except (BrokenPipeError, ConnectionResetError): return
+
   def do_POST(self):
     tok = self.server.tok
     raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
-    if self.path == "/v1/chat/completions":
+    if self.path.split("?")[0] == "/v1/messages":
+      ids: list[int] = tok.prefix()
+      system = body.get("system", "")
+      if isinstance(system, list): system = "\n".join(b.get("text","") for b in system if b.get("type")=="text")
+      if system: ids += tok.role("system") + tok.encode(system) + tok.end_turn()
+      messages = body.get("messages", [])
+      for i, msg in enumerate(messages):
+        ids += tok.role(msg["role"]) + tok.encode(self._content_to_text(msg["content"]))
+        if msg["role"] == "assistant" and i == len(messages) - 1: break
+        ids += tok.end_turn()
+      else: ids += tok.role("assistant")
+      max_tokens, temperature = body.get("max_tokens"), float(body.get("temperature", 1.0))
+      msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+      if body.get("stream"): self._stream_anthropic(ids, msg_id, self.server.model_name, max_tokens, temperature)
+      else:
+        model, dec, out, stop_reason = self.server.model, tok.stream_decoder(), [], "end_turn"
+        for next_id in model.generate(ids, temperature=temperature):
+          if tok.is_end(next_id): break
+          out.append(dec(next_id))
+          if max_tokens is not None and len(out) >= max_tokens: stop_reason = "max_tokens"; break
+        if (tail := dec()): out.append(tail)
+        self.send_data(json.dumps({"id":msg_id,"type":"message","role":"assistant",
+          "content":[{"type":"text","text":"".join(out)}],"model":self.server.model_name,
+          "stop_reason":stop_reason,"stop_sequence":None,
+          "usage":{"input_tokens":len(ids),"output_tokens":len(out),"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+        }).encode())
+    elif self.path == "/v1/chat/completions":
       # extract tokens, last assistant message is treated as prefill
       ids: list[int] = tok.prefix()
       for i, msg in enumerate(body["messages"]):
