@@ -197,7 +197,7 @@ def main():
     if dev == "AMD":
       # COMGR dylib must initialize before any Metal tensors are created to avoid LLVM state conflict (SIGBUS)
       from tinygrad.runtime.support.compiler_amd import compile_hip
-      compile_hip("extern \"C\" __global__ void _prewarm() {}")
+      compile_hip('extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1,1))) _prewarm() {}')
     from tinygrad.helpers import DEV
     DEV.value = dev
 
