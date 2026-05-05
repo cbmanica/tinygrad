@@ -100,6 +100,7 @@ models = {
   "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
   "qwen3.5:27b": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf",
   "qwen3.5:35b-a3b": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  "qwen3.5:35b-a3b-ks": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_S.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
@@ -188,7 +189,17 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--device", type=str, default=None, metavar="DEV", help="Run on specific device (e.g. AMD, METAL, CPU)")
   args = parser.parse_args()
+
+  if args.device:
+    dev = args.device.upper()
+    if dev == "AMD":
+      # COMGR dylib must initialize before any Metal tensors are created to avoid LLVM state conflict (SIGBUS)
+      from tinygrad.runtime.support.compiler_amd import compile_hip
+      compile_hip("extern \"C\" __global__ void _prewarm() {}")
+    from tinygrad.helpers import DEV
+    DEV.value = dev
 
   # load the model
   model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
