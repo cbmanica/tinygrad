@@ -217,7 +217,7 @@ def main():
       for _ in range(2): list(zip(range(2), model.generate([0])))
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok).serve_forever()
+  if args.serve: LLMServer(('127.0.0.1', args.serve), model, model_name, tok).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
