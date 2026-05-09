@@ -171,6 +171,9 @@ class Handler(HTTPRequestHandler):
       send_event("content_block_start", {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
       send_event("ping", {"type":"ping"})
       model, tok = self.server.model, self.server.tok
+      cache_start = model.get_start_pos(ids)
+      stderr_log(f"/v1/messages  {colored('--', 'BLACK')}  recurrent:{model.has_recurrent_block}  "
+                 f"in:{colored(f'{cache_start:5d}', 'green')} +{len(ids)-cache_start:5d}  chunk_size:{1 if model.has_recurrent_block else 32}\n")
       dec, out_count, stop_reason = tok.stream_decoder(), 0, "end_turn"
       for next_id in model.generate(ids, temperature=temperature):
         if tok.is_end(next_id): break
